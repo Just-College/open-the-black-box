@@ -1,19 +1,20 @@
-"""Reproduce Figures 2 and 3 from Sussillo & Barak (2013) with PyTorch.
+"""Reproduce Figures 2 and 3 from Sussillo & Barak (2013).
 
 The script trains a 3-bit flip-flop echo-state RNN with FORCE/RLS-style
 updates to the readout weights, then searches fixed points in the zero-input
 autonomous dynamics and plots low-dimensional phase-space summaries.
 
-The defaults are chosen for a CPU-friendly first pass. Increase ``--n`` and
-``--train-steps`` for a closer, slower run.
+Set ``RUN_CONFIG.preset = "paper"`` for the closest reproduction of the paper settings
+described in ``ref.txt``: N=1000, 600 fixed-point initial conditions sampled
+from all one-bit transition trajectories, and a strict q minimization pass.
+Use ``RUN_CONFIG.preset = "smoke"`` for a quick runtime check.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 import matplotlib
@@ -22,16 +23,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from scipy.optimize import minimize
 
 
 @dataclass
 class Config:
+    preset: str = "paper"
     seed: int = 3
-    n: int = 256
+    n: int = 1024
     g: float = 1.5
     dt: float = 0.1
-    train_steps: int = 9000
-    test_steps: int = 900
+    train_steps: int = 50000
+    test_steps: int = 1200
+    train_task: str = "random"
+    structured_fraction: float = 0.65
     pulse_width: int = 6
     min_interval: int = 22
     max_interval: int = 55
@@ -43,19 +48,138 @@ class Config:
     washout_steps: int = 150
     settle_steps: int = 260
     transition_relax_steps: int = 160
-    fixed_point_ics: int = 360
-    fixed_point_steps: int = 1800
+    fixed_point_ics: int = 600
+    fixed_point_steps: int = 2500
     fixed_point_lr: float = 0.035
-    fixed_point_q_thresh: float = 1e-6
-    cluster_distance: float = 0.65
+    fixed_point_q_thresh: float = 1e-10
+    fixed_point_refine: int = 160
+    fixed_point_refine_iter: int = 400
+    edge_interpolation_points: int = 17
+    critical_pulse_ics: bool = True
+    critical_bisection_steps: int = 14
+    critical_relax_extra: int = 120
+    critical_candidate_stride: int = 2
+    critical_attractor_q_thresh: float = 1e-5
+    cluster_distance: float = 0.35
     unstable_tol: float = 1e-3
     out_dir: str = "outputs"
-    device: str = "cpu"
+    device: str = "auto"
+    dtype: str = "float32"
+    redraw_from_state: str = ""
+    redraw_from_plot_data: str = ""
+    save_pdf: bool = True
+    figure3_left_elev: float = 18.0
+    figure3_left_azim: float = -62.0
+    figure3_right_elev: float = 62.0
+    figure3_right_azim: float = -58.0
+
+
+PRESETS: dict[str, dict[str, object]] = {
+    "smoke": {
+        "n": 96,
+        "train_steps": 1500,
+        "test_steps": 320,
+        "rls_every": 1,
+        "fixed_point_ics": 80,
+        "fixed_point_steps": 300,
+        "fixed_point_q_thresh": 1e-5,
+        "fixed_point_refine": 24,
+        "fixed_point_refine_iter": 80,
+        "edge_interpolation_points": 5,
+        "critical_pulse_ics": False,
+        "cluster_distance": 0.55,
+    },
+    "draft": {
+        "n": 256,
+        "train_steps": 20000,
+        "test_steps": 900,
+        "train_task": "mixed",
+        "rls_every": 1,
+        "fixed_point_ics": 240,
+        "fixed_point_steps": 1000,
+        "fixed_point_q_thresh": 1e-7,
+        "fixed_point_refine": 80,
+        "fixed_point_refine_iter": 220,
+        "edge_interpolation_points": 11,
+        "critical_pulse_ics": True,
+        "critical_bisection_steps": 10,
+        "critical_candidate_stride": 3,
+        "cluster_distance": 0.45,
+    },
+    "paper": {},
+    "strict": {
+        "seed": 8,
+        "n": 512,
+        "g": 1.3,
+        "train_steps": 50000,
+        "test_steps": 1200,
+        "train_task": "mixed",
+        "structured_fraction": 0.7,
+        "rls_every": 1,
+        "dtype": "float64",
+        "fixed_point_ics": 1200,
+        "fixed_point_steps": 3000,
+        "fixed_point_q_thresh": 2.25e-5,
+        "fixed_point_refine": 360,
+        "fixed_point_refine_iter": 700,
+        "cluster_distance": 0.4,
+    },
+}
+
+
+def make_config(preset: str = "paper", **overrides: object) -> Config:
+    """Build a run config from a named preset plus explicit Python overrides."""
+    if preset not in PRESETS:
+        raise ValueError("preset must be one of: smoke, draft, paper, strict")
+    values = asdict(Config(preset=preset))
+    values.update(PRESETS[preset])
+    values.update(overrides)
+    return Config(**values)
+
+
+def config_from_mapping(values: dict[str, object]) -> Config:
+    """Load configs saved by older script versions without requiring exact fields."""
+    valid = {field.name for field in fields(Config)}
+    clean = {key: value for key, value in values.items() if key in valid}
+    return Config(**clean)
+
+
+# Edit this object to choose the run mode and parameters. Outputs intentionally
+# come from this single explicit configuration block.
+RUN_CONFIG = make_config(
+    preset="strict",
+    out_dir="outputs",
+    redraw_from_plot_data="outputs/figure3_plot_data.pt",
+    figure3_left_elev=18.0,
+    figure3_left_azim=-62.0,
+    figure3_right_elev=62.0,
+    figure3_right_azim=-58.0,
+    save_pdf=True,
+)
 
 
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def resolve_device(device: str) -> torch.device:
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device(device)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False")
+    return dev
+
+
+def torch_dtype(cfg: Config) -> torch.dtype:
+    if cfg.dtype == "float32":
+        return torch.float32
+    if cfg.dtype == "float64":
+        return torch.float64
+    raise ValueError("--dtype must be float32 or float64")
 
 
 def make_pulse_task(
@@ -64,19 +188,21 @@ def make_pulse_task(
     min_interval: int,
     max_interval: int,
     rng: np.random.Generator,
+    initial_state: np.ndarray | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate sparse 3-channel pulses and persistent +/-1 memory targets."""
     u = np.zeros((steps, 3), dtype=np.float32)
     y = np.zeros((steps, 3), dtype=np.float32)
-    state = np.zeros(3, dtype=np.float32)
+    state = np.zeros(3, dtype=np.float32) if initial_state is None else initial_state.astype(np.float32).copy()
     starts: dict[int, tuple[int, float]] = {}
 
     cursor = 0
-    for bit in rng.permutation(3):
-        sign = float(rng.choice([-1.0, 1.0]))
-        starts[cursor] = (int(bit), sign)
-        u[cursor : cursor + pulse_width, bit] = sign
-        cursor += pulse_width + 2
+    if initial_state is None:
+        for bit in rng.permutation(3):
+            sign = float(rng.choice([-1.0, 1.0]))
+            starts[cursor] = (int(bit), sign)
+            u[cursor : cursor + pulse_width, bit] = sign
+            cursor += pulse_width + 2
 
     next_pulse = cursor + int(rng.integers(min_interval, max_interval + 1))
     while next_pulse + pulse_width < steps:
@@ -94,13 +220,90 @@ def make_pulse_task(
     return torch.from_numpy(u), torch.from_numpy(y)
 
 
+def all_memories() -> list[tuple[int, int, int]]:
+    return [tuple(int(v) for v in vals) for vals in np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1])).T.reshape(-1, 3)]
+
+
+def make_structured_pulse_task(
+    steps: int,
+    pulse_width: int,
+    min_interval: int,
+    max_interval: int,
+    rng: np.random.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate a balanced sequence that explicitly covers all one-bit transitions."""
+    u_rows: list[np.ndarray] = []
+    y_rows: list[np.ndarray] = []
+    state = np.zeros(3, dtype=np.float32)
+    memories = all_memories()
+    current = np.array(rng.choice([-1.0, 1.0], size=3), dtype=np.float32)
+
+    def append_steps(n: int, pulse: tuple[int, float] | None = None) -> None:
+        nonlocal state
+        if pulse is not None:
+            bit, sign = pulse
+            state[bit] = sign
+        for t in range(n):
+            u_t = np.zeros(3, dtype=np.float32)
+            if pulse is not None and t < pulse_width:
+                u_t[pulse[0]] = pulse[1]
+            u_rows.append(u_t)
+            y_rows.append(state.copy())
+
+    for bit, sign in enumerate(current):
+        append_steps(pulse_width, (bit, float(sign)))
+        append_steps(int(rng.integers(2, min_interval + 1)))
+
+    while len(u_rows) < steps:
+        directed_edges = [(mem, bit) for mem in memories for bit in range(3)]
+        rng.shuffle(directed_edges)
+        for mem, bit in directed_edges:
+            mem_arr = np.array(mem, dtype=np.float32)
+            for route_bit in rng.permutation(3):
+                if state[route_bit] != mem_arr[route_bit]:
+                    append_steps(pulse_width, (int(route_bit), float(mem_arr[route_bit])))
+                    append_steps(int(rng.integers(min_interval, max_interval + 1)))
+            flip_sign = float(-state[bit])
+            append_steps(pulse_width, (bit, flip_sign))
+            append_steps(int(rng.integers(min_interval, max_interval + 1)))
+            if len(u_rows) >= steps:
+                break
+
+    return torch.from_numpy(np.stack(u_rows[:steps])), torch.from_numpy(np.stack(y_rows[:steps]))
+
+
+def make_training_task(cfg: Config, rng: np.random.Generator) -> tuple[torch.Tensor, torch.Tensor]:
+    if cfg.train_task == "random":
+        return make_pulse_task(cfg.train_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng)
+    if cfg.train_task == "structured":
+        return make_structured_pulse_task(cfg.train_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng)
+    if cfg.train_task == "mixed":
+        structured_steps = int(round(cfg.train_steps * cfg.structured_fraction))
+        structured_steps = min(max(structured_steps, 0), cfg.train_steps)
+        random_steps = cfg.train_steps - structured_steps
+        parts_u: list[torch.Tensor] = []
+        parts_y: list[torch.Tensor] = []
+        if structured_steps:
+            u_s, y_s = make_structured_pulse_task(structured_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng)
+            parts_u.append(u_s)
+            parts_y.append(y_s)
+        if random_steps:
+            initial_state = parts_y[-1][-1].numpy() if parts_y else None
+            u_r, y_r = make_pulse_task(random_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng, initial_state)
+            parts_u.append(u_r)
+            parts_y.append(y_r)
+        return torch.cat(parts_u, dim=0), torch.cat(parts_y, dim=0)
+    raise ValueError("--train-task must be one of: random, structured, mixed")
+
+
 def init_network(cfg: Config) -> dict[str, torch.Tensor]:
     n = cfg.n
-    dev = torch.device(cfg.device)
-    j = cfg.g * torch.randn(n, n, device=dev) / math.sqrt(n)
-    b = cfg.input_scale * torch.randn(n, 3, device=dev) / math.sqrt(3)
-    wfb = cfg.feedback_scale * torch.randn(n, 3, device=dev) / math.sqrt(3)
-    wout = torch.zeros(3, n, device=dev)
+    dev = resolve_device(cfg.device)
+    dtype = torch_dtype(cfg)
+    j = cfg.g * torch.randn(n, n, device=dev, dtype=dtype) / math.sqrt(n)
+    b = cfg.input_scale * torch.randn(n, 3, device=dev, dtype=dtype) / math.sqrt(3)
+    wfb = cfg.feedback_scale * torch.randn(n, 3, device=dev, dtype=dtype) / math.sqrt(3)
+    wout = torch.zeros(3, n, device=dev, dtype=dtype)
     return {"j": j, "b": b, "wfb": wfb, "wout": wout}
 
 
@@ -124,12 +327,13 @@ def train_force(
     u: torch.Tensor,
     target: torch.Tensor,
 ) -> list[float]:
-    dev = torch.device(cfg.device)
-    u = u.to(dev)
-    target = target.to(dev)
+    dev = resolve_device(cfg.device)
+    dtype = net["j"].dtype
+    u = u.to(dev, dtype=dtype)
+    target = target.to(dev, dtype=dtype)
     n = cfg.n
-    x = torch.zeros(n, device=dev)
-    p = torch.eye(n, device=dev) / cfg.rls_alpha
+    x = torch.zeros(n, device=dev, dtype=dtype)
+    p = torch.eye(n, device=dev, dtype=dtype) / cfg.rls_alpha
     losses: list[float] = []
     if cfg.feedback_during_training not in {"target", "output"}:
         raise ValueError("--feedback-during-training must be 'target' or 'output'")
@@ -159,9 +363,10 @@ def simulate(
     u: torch.Tensor,
     x0: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dev = torch.device(cfg.device)
-    u = u.to(dev)
-    x = torch.zeros(cfg.n, device=dev) if x0 is None else x0.clone().to(dev)
+    dev = resolve_device(cfg.device)
+    dtype = net["j"].dtype
+    u = u.to(dev, dtype=dtype)
+    x = torch.zeros(cfg.n, device=dev, dtype=dtype) if x0 is None else x0.clone().to(dev, dtype=dtype)
     xs, zs = [], []
     for t in range(u.shape[0]):
         x, _, z = step_rnn(x, u[t], net, cfg.dt)
@@ -172,17 +377,18 @@ def simulate(
 
 @torch.no_grad()
 def settle_to_memory(cfg: Config, net: dict[str, torch.Tensor], memory: np.ndarray) -> torch.Tensor:
-    dev = torch.device(cfg.device)
-    x = torch.zeros(cfg.n, device=dev)
+    dev = resolve_device(cfg.device)
+    dtype = net["j"].dtype
+    x = torch.zeros(cfg.n, device=dev, dtype=dtype)
     for bit, sign in enumerate(memory):
-        u = torch.zeros(1, cfg.pulse_width, 3, device=dev)
+        u = torch.zeros(1, cfg.pulse_width, 3, device=dev, dtype=dtype)
         u[0, :, bit] = float(sign)
         for t in range(cfg.pulse_width):
             x, _, _ = step_rnn(x, u[0, t], net, cfg.dt)
         for _ in range(cfg.settle_steps // 3):
-            x, _, _ = step_rnn(x, torch.zeros(3, device=dev), net, cfg.dt)
+            x, _, _ = step_rnn(x, torch.zeros(3, device=dev, dtype=dtype), net, cfg.dt)
     for _ in range(cfg.settle_steps):
-        x, _, _ = step_rnn(x, torch.zeros(3, device=dev), net, cfg.dt)
+        x, _, _ = step_rnn(x, torch.zeros(3, device=dev, dtype=dtype), net, cfg.dt)
     return x.detach().cpu()
 
 
@@ -193,7 +399,8 @@ def make_transition_trajectories(
     memory_x: dict[tuple[int, int, int], torch.Tensor],
     amplitudes: list[float] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    dev = torch.device(cfg.device)
+    dev = resolve_device(cfg.device)
+    dtype = net["j"].dtype
     transitions: list[dict[str, object]] = []
     detailed: list[dict[str, object]] = []
 
@@ -201,7 +408,7 @@ def make_transition_trajectories(
         mem_arr = np.array(mem, dtype=np.float32)
         for bit in range(3):
             target_sign = -mem_arr[bit]
-            u = torch.zeros(cfg.pulse_width + cfg.transition_relax_steps, 3, device=dev)
+            u = torch.zeros(cfg.pulse_width + cfg.transition_relax_steps, 3, device=dev, dtype=dtype)
             u[: cfg.pulse_width, bit] = float(target_sign)
             xs, _, uu = simulate(cfg, net, u.cpu(), x0_cpu)
             new_mem = mem_arr.copy()
@@ -221,7 +428,7 @@ def make_transition_trajectories(
     source = (-1, -1, -1)
     x0_cpu = memory_x[source]
     for amp in amplitudes:
-        u = torch.zeros(cfg.pulse_width + cfg.transition_relax_steps, 3, device=dev)
+        u = torch.zeros(cfg.pulse_width + cfg.transition_relax_steps, 3, device=dev, dtype=dtype)
         u[: cfg.pulse_width, 0] = amp
         xs, _, uu = simulate(cfg, net, u.cpu(), x0_cpu)
         detailed.append({"amp": amp, "xs": xs, "u": uu})
@@ -229,8 +436,222 @@ def make_transition_trajectories(
     return transitions, detailed
 
 
+def make_edge_interpolation_initial_states(
+    cfg: Config,
+    memory_x: dict[tuple[int, int, int], torch.Tensor],
+) -> torch.Tensor:
+    """Seed q minimization near one-bit basin boundaries.
+
+    The paper sampled initial conditions from transition trajectories. Adding
+    straight interpolants between the corresponding attractors keeps the search
+    faithful to the same 24 one-bit transition structure while improving the
+    chance of landing on separatrix saddles in finite CPU runs.
+    """
+    if cfg.edge_interpolation_points <= 0:
+        first = next(iter(memory_x.values()))
+        return first.new_empty((0, first.numel()))
+
+    states: list[torch.Tensor] = []
+    alphas = torch.linspace(0.15, 0.85, cfg.edge_interpolation_points)
+    for mem, x0 in memory_x.items():
+        for bit in range(3):
+            # Use each undirected cube edge once.
+            if mem[bit] != -1:
+                continue
+            target = list(mem)
+            target[bit] = 1
+            x1 = memory_x[tuple(target)]
+            for alpha in alphas:
+                states.append((1.0 - alpha) * x0 + alpha * x1)
+    return torch.stack(states) if states else next(iter(memory_x.values())).new_empty((0, cfg.n))
+
+
+def memory_states_from_stable_fixed_points(
+    memory_x: dict[tuple[int, int, int], torch.Tensor],
+    fps: torch.Tensor,
+    fp_info: list[dict[str, object]],
+) -> dict[tuple[int, int, int], torch.Tensor]:
+    refined = dict(memory_x)
+    for i, info in enumerate(fp_info):
+        if info["unstable_count"] != 0:
+            continue
+        mem = tuple(int(v) for v in info["memory"])
+        if mem in refined:
+            refined[mem] = fps[i].detach().cpu()
+    return refined
+
+
+@torch.no_grad()
+def transition_final_sign(
+    cfg: Config,
+    net: dict[str, torch.Tensor],
+    x0_cpu: torch.Tensor,
+    bit: int,
+    pulse_sign: float,
+    amplitude: float,
+    relax_extra: int,
+) -> int:
+    dev = resolve_device(cfg.device)
+    dtype = net["j"].dtype
+    u = torch.zeros(
+        cfg.pulse_width + cfg.transition_relax_steps + relax_extra,
+        3,
+        device=dev,
+        dtype=dtype,
+    )
+    u[: cfg.pulse_width, bit] = pulse_sign * amplitude
+    _, zs, _ = simulate(cfg, net, u.cpu(), x0_cpu)
+    sign = int(torch.sign(zs[-1, bit]).item())
+    return sign if sign != 0 else 1
+
+
+@torch.no_grad()
+def make_critical_pulse_initial_states(
+    cfg: Config,
+    net: dict[str, torch.Tensor],
+    memory_x: dict[tuple[int, int, int], torch.Tensor],
+) -> tuple[torch.Tensor, list[dict[str, object]]]:
+    """Sample trajectories near the input-amplitude threshold for each transition."""
+    dev = resolve_device(cfg.device)
+    dtype = net["j"].dtype
+    states: list[torch.Tensor] = []
+    thresholds: list[dict[str, object]] = []
+
+    for mem, x0_cpu in memory_x.items():
+        for bit in range(3):
+            source_sign = int(mem[bit])
+            pulse_sign = float(-source_sign)
+            lo, hi = 0.0, 1.0
+            sign_lo = transition_final_sign(cfg, net, x0_cpu, bit, pulse_sign, lo, cfg.critical_relax_extra)
+            sign_hi = transition_final_sign(cfg, net, x0_cpu, bit, pulse_sign, hi, cfg.critical_relax_extra)
+            if sign_lo != source_sign or sign_hi != -source_sign:
+                continue
+
+            for _ in range(cfg.critical_bisection_steps):
+                mid = 0.5 * (lo + hi)
+                sign_mid = transition_final_sign(cfg, net, x0_cpu, bit, pulse_sign, mid, cfg.critical_relax_extra)
+                if sign_mid == -source_sign:
+                    hi = mid
+                else:
+                    lo = mid
+
+            amp = 0.5 * (lo + hi)
+            thresholds.append({"from": mem, "bit": bit, "amplitude": float(amp)})
+            for delta in (0.0, -0.015, 0.015):
+                a = min(1.0, max(0.0, amp + delta))
+                u = torch.zeros(
+                    cfg.pulse_width + cfg.transition_relax_steps + cfg.critical_relax_extra,
+                    3,
+                    device=dev,
+                    dtype=dtype,
+                )
+                u[: cfg.pulse_width, bit] = pulse_sign * a
+                xs, _, _ = simulate(cfg, net, u.cpu(), x0_cpu)
+                states.append(xs[:: cfg.critical_candidate_stride])
+
+    if not states:
+        first = next(iter(memory_x.values()))
+        return first.new_empty((0, first.numel())), thresholds
+    return torch.cat(states, dim=0), thresholds
+
+
+@torch.no_grad()
+def validate_flipflop_behavior(
+    cfg: Config,
+    net: dict[str, torch.Tensor],
+    memory_x: dict[tuple[int, int, int], torch.Tensor],
+) -> dict[str, object]:
+    dev = resolve_device(cfg.device)
+    dtype = net["j"].dtype
+    zero_u = torch.zeros(cfg.settle_steps, 3, device=dev, dtype=dtype)
+    memory_ok = 0
+    transition_ok = 0
+    transition_details: list[dict[str, object]] = []
+
+    for mem, x0_cpu in memory_x.items():
+        _, z_hold, _ = simulate(cfg, net, zero_u.cpu(), x0_cpu)
+        hold_sign = tuple(int(v) for v in torch.sign(z_hold[-1]).cpu().numpy())
+        if hold_sign == mem:
+            memory_ok += 1
+
+        for bit in range(3):
+            target = list(mem)
+            target[bit] *= -1
+            target_tuple = tuple(target)
+            u = torch.zeros(cfg.pulse_width + cfg.transition_relax_steps, 3, device=dev, dtype=dtype)
+            u[: cfg.pulse_width, bit] = float(target_tuple[bit])
+            _, z, _ = simulate(cfg, net, u.cpu(), x0_cpu)
+            final_sign = tuple(int(v) for v in torch.sign(z[-1]).cpu().numpy())
+            ok = final_sign == target_tuple
+            transition_ok += int(ok)
+            transition_details.append(
+                {
+                    "from": mem,
+                    "bit": bit,
+                    "to": target_tuple,
+                    "final": final_sign,
+                    "ok": ok,
+                }
+            )
+
+    return {
+        "memory_hold_ok": memory_ok,
+        "memory_hold_total": len(memory_x),
+        "one_bit_transition_ok": transition_ok,
+        "one_bit_transition_total": len(memory_x) * 3,
+        "transition_details": transition_details,
+    }
+
+
 def autonomous_velocity(x: torch.Tensor, jeff: torch.Tensor) -> torch.Tensor:
     return -x + torch.tanh(x) @ jeff.T
+
+
+def q_and_grad_numpy(x: np.ndarray, jeff: np.ndarray) -> tuple[float, np.ndarray]:
+    r = np.tanh(x)
+    f = -x + jeff @ r
+    q = 0.5 * np.mean(f * f)
+    grad = (-f + (1.0 - r * r) * (jeff.T @ f)) / x.size
+    return float(q), grad.astype(np.float64, copy=False)
+
+
+def refine_fixed_points_lbfgs(
+    cfg: Config,
+    jeff: torch.Tensor,
+    xs: torch.Tensor,
+    q: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if cfg.fixed_point_refine <= 0 or xs.numel() == 0:
+        return xs.new_empty((0, xs.shape[1] if xs.ndim == 2 else 0)), q.new_empty((0,))
+
+    jeff_np = jeff.detach().cpu().double().numpy()
+    order = torch.argsort(q)[: min(cfg.fixed_point_refine, len(q))].tolist()
+    refined_x: list[np.ndarray] = []
+    refined_q: list[float] = []
+
+    for idx in order:
+        x0 = xs[idx].detach().cpu().double().numpy()
+
+        def objective(v: np.ndarray) -> tuple[float, np.ndarray]:
+            return q_and_grad_numpy(v, jeff_np)
+
+        res = minimize(
+            objective,
+            x0,
+            method="L-BFGS-B",
+            jac=True,
+            options={
+                "maxiter": cfg.fixed_point_refine_iter,
+                "ftol": 1e-15,
+                "gtol": 1e-10,
+                "maxls": 40,
+            },
+        )
+        q_val, _ = q_and_grad_numpy(res.x, jeff_np)
+        refined_x.append(res.x.astype(np.float32 if xs.dtype == torch.float32 else np.float64))
+        refined_q.append(q_val)
+
+    return torch.from_numpy(np.stack(refined_x)), torch.tensor(refined_q, dtype=q.dtype)
 
 
 def find_fixed_points(
@@ -238,40 +659,48 @@ def find_fixed_points(
     net: dict[str, torch.Tensor],
     initial_states: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    dev = torch.device(cfg.device)
-    j = net["j"].to(dev)
-    wfb = net["wfb"].to(dev)
-    wout = net["wout"].to(dev)
+    dev = resolve_device(cfg.device)
+    dtype = net["j"].dtype
+    j = net["j"].to(dev, dtype=dtype)
+    wfb = net["wfb"].to(dev, dtype=dtype)
+    wout = net["wout"].to(dev, dtype=dtype)
     jeff = j + wfb @ wout
 
     if initial_states.shape[0] > cfg.fixed_point_ics:
         idx = torch.randperm(initial_states.shape[0])[: cfg.fixed_point_ics]
         initial_states = initial_states[idx]
-    x = initial_states.to(dev).clone().detach().requires_grad_(True)
+    x = initial_states.to(dev, dtype=dtype).clone().detach().requires_grad_(True)
     opt = torch.optim.Adam([x], lr=cfg.fixed_point_lr)
     best_x = x.detach().clone()
-    best_q = torch.full((x.shape[0],), float("inf"), device=dev)
+    best_q = torch.full((x.shape[0],), float("inf"), device=dev, dtype=dtype)
 
+    decay_points = {int(cfg.fixed_point_steps * 0.45), int(cfg.fixed_point_steps * 0.75)}
     for step in range(cfg.fixed_point_steps):
         opt.zero_grad(set_to_none=True)
         f = autonomous_velocity(x, jeff)
         q = 0.5 * torch.mean(f * f, dim=1)
         loss = q.mean()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_([x], max_norm=10.0)
         opt.step()
         with torch.no_grad():
             improved = q < best_q
             best_q[improved] = q[improved]
             best_x[improved] = x.detach()[improved]
-        if step in (800, 1300):
+        if step in decay_points:
             for group in opt.param_groups:
                 group["lr"] *= 0.35
 
     with torch.no_grad():
         f = autonomous_velocity(best_x, jeff)
-        q = 0.5 * torch.mean(f * f, dim=1)
-    return best_x.detach().cpu(), q.detach().cpu()
+        best_q = 0.5 * torch.mean(f * f, dim=1)
 
+    cpu_x = best_x.detach().cpu()
+    cpu_q = best_q.detach().cpu()
+    refined_x, refined_q = refine_fixed_points_lbfgs(cfg, jeff, cpu_x, cpu_q)
+    all_x = torch.cat([cpu_x, refined_x.to(cpu_x.dtype)], dim=0)
+    all_q = torch.cat([cpu_q, refined_q.to(cpu_q.dtype)], dim=0)
+    return all_x, all_q
 
 def cluster_fixed_points(
     xs: torch.Tensor,
@@ -356,6 +785,12 @@ def fixed_point_json_summary(fp_info: list[dict[str, object]]) -> list[dict[str,
     return keep
 
 
+def save_figure(fig: plt.Figure, out_path: Path, save_pdf: bool = True) -> None:
+    fig.savefig(out_path, dpi=220)
+    if save_pdf:
+        fig.savefig(out_path.with_suffix(".pdf"))
+
+
 def plot_figure2(
     out_path: Path,
     u: torch.Tensor,
@@ -407,8 +842,234 @@ def plot_figure2(
     ax2.set_title("Echo-state architecture")
     ax2.axis("off")
 
-    fig.suptitle("Figure 2 reproduction: 3-bit flip-flop task", fontsize=14)
-    fig.savefig(out_path, dpi=180)
+    fig.suptitle("Figure 2: 3-bit flip-flop task", fontsize=14)
+    save_figure(fig, out_path)
+    plt.close(fig)
+
+
+def build_figure3_plot_data(
+    cfg: Config,
+    net: dict[str, torch.Tensor],
+    transitions: list[dict[str, object]],
+    detailed: list[dict[str, object]],
+    fps: torch.Tensor,
+    fp_info: list[dict[str, object]],
+) -> dict[str, object]:
+    transition_states = torch.cat([item["xs"][::5] for item in transitions], dim=0)
+    _, mean, comps = pca_fit_transform(transition_states, 3)
+    fp_proj = project(fps, mean, comps).detach().cpu().to(torch.float32)
+
+    left_transition_curves = [
+        project(item["xs"], mean, comps).detach().cpu().to(torch.float32)
+        for item in transitions
+    ]
+
+    stable_idx = [i for i, info in enumerate(fp_info) if info["unstable_count"] == 0]
+    saddle_idx = [i for i, info in enumerate(fp_info) if info["unstable_count"] == 1]
+    other_idx = [i for i, info in enumerate(fp_info) if info["unstable_count"] > 1]
+    left_points = {
+        "stable": fp_proj[stable_idx] if stable_idx else torch.empty(0, 3),
+        "saddle": fp_proj[saddle_idx] if saddle_idx else torch.empty(0, 3),
+        "other": fp_proj[other_idx] if other_idx else torch.empty(0, 3),
+    }
+
+    saddle_trace_steps = max(cfg.transition_relax_steps * 4, cfg.settle_steps * 2, 640)
+    saddle_perturbation = 0.25
+    unstable_lines: list[torch.Tensor] = []
+    saddle_traces: list[torch.Tensor] = []
+    for i, info in enumerate(fp_info):
+        vecs = info["unstable_vectors"]
+        if vecs.shape[1] == 0:
+            continue
+        for k in range(vecs.shape[1]):
+            v = torch.from_numpy(vecs[:, k])
+            v = v / (torch.linalg.norm(v) + 1e-8)
+            line = torch.stack([fps[i] - 1.2 * v, fps[i] + 1.2 * v])
+            unstable_lines.append(project(line, mean, comps).detach().cpu().to(torch.float32))
+
+            if info["unstable_count"] == 1 and k == 0:
+                for sign in [-1.0, 1.0]:
+                    x0 = fps[i] + sign * saddle_perturbation * v
+                    u0 = torch.zeros(saddle_trace_steps, 3, dtype=net["j"].dtype)
+                    xs, _, _ = simulate(cfg, net, u0, x0)
+                    saddle_traces.append(project(xs, mean, comps).detach().cpu().to(torch.float32))
+
+    stable_by_memory = {
+        tuple(int(v) for v in fp_info[i]["memory"]): fps[i].detach().cpu()
+        for i in stable_idx
+    }
+    connected_example: dict[str, object] | None = None
+    connection_steps = max(cfg.transition_relax_steps * 10, cfg.settle_steps * 4, 1600)
+    for i in saddle_idx:
+        vecs = fp_info[i]["unstable_vectors"]
+        if vecs.shape[1] == 0:
+            continue
+        v = torch.from_numpy(vecs[:, 0]).to(fps[i].dtype)
+        v = v / (torch.linalg.norm(v) + 1e-8)
+        endpoint_memories: list[tuple[int, int, int]] = []
+        for sign in [-1.0, 1.0]:
+            x0 = fps[i] + sign * saddle_perturbation * v
+            u0 = torch.zeros(connection_steps, 3, dtype=net["j"].dtype)
+            _, zs, _ = simulate(cfg, net, u0, x0)
+            endpoint_memories.append(tuple(int(x) for x in torch.sign(zs[-1]).numpy()))
+        a, b = endpoint_memories
+        if a == b or a not in stable_by_memory or b not in stable_by_memory:
+            continue
+        diff_bits = [bit for bit in range(3) if a[bit] != b[bit]]
+        if len(diff_bits) != 1:
+            continue
+        bit = diff_bits[0]
+        source, target = (a, b) if b[bit] == 1 else (b, a)
+        pulse_sign = float(target[bit])
+        relax_steps = cfg.pulse_width + max(cfg.transition_relax_steps * 3, cfg.settle_steps * 2)
+
+        def final_memory_for(src: tuple[int, int, int], dst: tuple[int, int, int]) -> tuple[int, int, int]:
+            u = torch.zeros(relax_steps, 3, dtype=net["j"].dtype)
+            u[: cfg.pulse_width, bit] = float(dst[bit])
+            _, zs, _ = simulate(cfg, net, u, stable_by_memory[src])
+            return tuple(int(x) for x in torch.sign(zs[-1]).numpy())
+
+        if final_memory_for(source, target) != target:
+            source, target = target, source
+            pulse_sign = float(target[bit])
+            if final_memory_for(source, target) != target:
+                continue
+
+        connected_example = {
+            "saddle_index": i,
+            "saddle": fps[i].detach().cpu(),
+            "source": source,
+            "target": target,
+            "bit": bit,
+            "pulse_sign": pulse_sign,
+            "relax_steps": relax_steps,
+        }
+        break
+
+    right_curves: list[dict[str, object]] = []
+    right_points: list[dict[str, object]] = []
+    if connected_example is not None:
+        bit = int(connected_example["bit"])
+        source = connected_example["source"]
+        target = connected_example["target"]
+        pulse_sign = float(connected_example["pulse_sign"])
+        relax_steps = int(connected_example["relax_steps"])
+        for amp in np.linspace(0.0, 1.0, 11):
+            u = torch.zeros(relax_steps, 3, dtype=net["j"].dtype)
+            u[: cfg.pulse_width, bit] = pulse_sign * float(amp)
+            xs, _, uu = simulate(cfg, net, u, stable_by_memory[source])
+            pts = project(xs, mean, comps).detach().cpu()
+            inp = uu[:, bit].detach().cpu() * pulse_sign
+            coords = torch.stack([pts[:, 2], inp, pts[:, 0]], dim=1).to(torch.float32)
+            is_full = abs(float(amp) - 1.0) < 1e-6
+            right_curves.append(
+                {
+                    "coords": coords,
+                    "color": "#2252c7" if is_full else "#52c7dc",
+                    "lw": 1.8 if is_full else 0.85,
+                    "alpha": 0.9,
+                }
+            )
+
+        for mem in (source, target):
+            p = project(stable_by_memory[mem][None, :], mean, comps).detach().cpu()[0]
+            right_points.append({"coords": torch.tensor([p[2], 0.0, p[0]], dtype=torch.float32), "kind": "stable"})
+        saddle_point = connected_example["saddle"]
+        p = project(saddle_point[None, :], mean, comps).detach().cpu()[0]
+        right_points.append({"coords": torch.tensor([p[2], 0.0, p[0]], dtype=torch.float32), "kind": "saddle"})
+        right_ylabel = f"input {bit + 1}"
+        right_title = f"Input-driven transition {source} -> {target}"
+    else:
+        for item in detailed:
+            pts = project(item["xs"], mean, comps).detach().cpu()
+            inp = item["u"][:, 0].detach().cpu()
+            coords = torch.stack([pts[:, 2], inp, pts[:, 0]], dim=1).to(torch.float32)
+            is_full = abs(float(item["amp"]) - 1.0) < 1e-6
+            right_curves.append(
+                {
+                    "coords": coords,
+                    "color": "#2252c7" if is_full else "#52c7dc",
+                    "lw": 1.7 if is_full else 0.9,
+                    "alpha": 0.9,
+                }
+            )
+        right_ylabel = "input 1"
+        right_title = "Input-amplitude perturbation"
+
+    return {
+        "num_fixed_points": int(len(fps)),
+        "stable_count": len(stable_idx),
+        "saddle_count": len(saddle_idx),
+        "other_count": len(other_idx),
+        "left": {
+            "transition_curves": left_transition_curves,
+            "points": left_points,
+            "unstable_lines": unstable_lines,
+            "saddle_traces": saddle_traces,
+        },
+        "right": {
+            "curves": right_curves,
+            "points": right_points,
+            "ylabel": right_ylabel,
+            "title": right_title,
+        },
+    }
+
+
+def render_figure3_plot_data(out_path: Path, cfg: Config, data: dict[str, object]) -> None:
+    fig = plt.figure(figsize=(13, 6), constrained_layout=True)
+    ax = fig.add_subplot(1, 2, 1, projection="3d")
+    left = data["left"]
+    for pts_t in left["transition_curves"]:
+        pts = pts_t.numpy()
+        ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], color="#2f61d5", lw=0.65, alpha=0.8)
+
+    points = left["points"]
+    if points["stable"].numel():
+        pts = points["stable"].numpy()
+        ax.scatter(*pts.T, marker="x", s=80, c="black", lw=2.0, label="stable")
+    if points["saddle"].numel():
+        pts = points["saddle"].numpy()
+        ax.scatter(*pts.T, marker="x", s=70, c="#2cbf31", lw=2.0, label="1D saddle")
+    if points["other"].numel():
+        pts = points["other"].numpy()
+        ax.scatter(*pts.T, marker="x", s=70, c="#d752a8", lw=2.0, label="other")
+
+    for line_t in left["unstable_lines"]:
+        pts = line_t.numpy()
+        ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], color="red", lw=1.8, alpha=0.9)
+    for trace_t in left["saddle_traces"]:
+        pts = trace_t.numpy()
+        ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], color="red", lw=0.8, alpha=0.72)
+
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_zlabel("PC3")
+    ax.set_title("Fixed points and 1-bit transitions")
+    ax.view_init(elev=cfg.figure3_left_elev, azim=cfg.figure3_left_azim)
+    ax.legend(loc="upper left", fontsize=8)
+
+    ax2 = fig.add_subplot(1, 2, 2, projection="3d")
+    right = data["right"]
+    for item in right["curves"]:
+        pts = item["coords"].numpy()
+        ax2.plot(pts[:, 0], pts[:, 1], pts[:, 2], color=item["color"], lw=item["lw"], alpha=item["alpha"])
+    for item in right["points"]:
+        p = item["coords"].numpy()
+        color = "black" if item["kind"] == "stable" else "#2cbf31"
+        ax2.scatter([p[0]], [p[1]], [p[2]], marker="x", s=70, c=color, lw=2.0)
+    ax2.set_ylabel(right["ylabel"])
+    ax2.set_title(right["title"])
+    ax2.set_xlabel("PC3")
+    ax2.set_zlabel("PC1")
+    ax2.view_init(elev=cfg.figure3_right_elev, azim=cfg.figure3_right_azim)
+
+    fig.suptitle(
+        f"Figure 3: {data['num_fixed_points']} fixed points "
+        f"({data['stable_count']} stable, {data['saddle_count']} one-dimensional saddles)",
+        fontsize=14,
+    )
+    save_figure(fig, out_path, save_pdf=cfg.save_pdf)
     plt.close(fig)
 
 
@@ -421,100 +1082,114 @@ def plot_figure3(
     fps: torch.Tensor,
     fp_info: list[dict[str, object]],
 ) -> None:
-    transition_states = torch.cat([item["xs"][::5] for item in transitions], dim=0)
-    pca_data = torch.cat([transition_states, fps], dim=0)
-    _, mean, comps = pca_fit_transform(pca_data, 3)
-    fp_proj = project(fps, mean, comps).numpy()
+    data = build_figure3_plot_data(cfg, net, transitions, detailed, fps, fp_info)
+    torch.save(data, out_path.with_name("figure3_plot_data.pt"))
+    render_figure3_plot_data(out_path, cfg, data)
 
-    fig = plt.figure(figsize=(13, 6), constrained_layout=True)
-    ax = fig.add_subplot(1, 2, 1, projection="3d")
-    for item in transitions:
-        pts = project(item["xs"], mean, comps).numpy()
-        ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], color="#2f61d5", lw=0.65, alpha=0.8)
 
-    stable_idx = [i for i, info in enumerate(fp_info) if info["unstable_count"] == 0]
-    saddle_idx = [i for i, info in enumerate(fp_info) if info["unstable_count"] == 1]
-    other_idx = [i for i, info in enumerate(fp_info) if info["unstable_count"] > 1]
-    if stable_idx:
-        ax.scatter(*fp_proj[stable_idx].T, marker="x", s=80, c="black", lw=2.0, label="stable")
-    if saddle_idx:
-        ax.scatter(*fp_proj[saddle_idx].T, marker="x", s=70, c="#2cbf31", lw=2.0, label="1D saddle")
-    if other_idx:
-        ax.scatter(*fp_proj[other_idx].T, marker="x", s=70, c="#d752a8", lw=2.0, label="other")
+def redraw_figure3_from_state(cfg: Config) -> None:
+    state_path = Path(cfg.redraw_from_state)
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    state_cfg = config_from_mapping(state["config"])
 
-    comp_np = comps.numpy()
-    mean_np = mean.numpy()
-    for i, info in enumerate(fp_info):
-        vecs = info["unstable_vectors"]
-        if vecs.shape[1] == 0:
-            continue
-        for k in range(vecs.shape[1]):
-            v = torch.from_numpy(vecs[:, k])
-            v = v / (torch.linalg.norm(v) + 1e-8)
-            line = torch.stack([fps[i] - 1.2 * v, fps[i] + 1.2 * v])
-            p = project(line, mean, comps).numpy()
-            ax.plot(p[:, 0], p[:, 1], p[:, 2], color="red", lw=1.5, alpha=0.85)
+    values = asdict(state_cfg)
+    values["out_dir"] = cfg.out_dir
+    values["device"] = "cpu"
+    values["redraw_from_state"] = cfg.redraw_from_state
+    values["figure3_left_elev"] = cfg.figure3_left_elev
+    values["figure3_left_azim"] = cfg.figure3_left_azim
+    values["figure3_right_elev"] = cfg.figure3_right_elev
+    values["figure3_right_azim"] = cfg.figure3_right_azim
+    redraw_cfg = Config(**values)
 
-            if info["unstable_count"] == 1 and k == 0:
-                for sign in [-1.0, 1.0]:
-                    x0 = fps[i] + sign * 0.18 * v
-                    u0 = torch.zeros(cfg.transition_relax_steps, 3)
-                    xs, _, _ = simulate(cfg, net, u0, x0)
-                    pp = project(xs, mean, comps).numpy()
-                    ax.plot(pp[:, 0], pp[:, 1], pp[:, 2], color="red", lw=0.5, alpha=0.65)
+    out_dir = Path(redraw_cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    net = {key: value.detach().cpu() for key, value in state["net"].items()}
+    fps = state["fixed_points"].detach().cpu()
 
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
-    ax.set_zlabel("PC3")
-    ax.set_title("Fixed points and 1-bit transitions")
-    ax.view_init(elev=18, azim=-62)
-    ax.legend(loc="upper left", fontsize=8)
+    fp_info = classify_fixed_points(redraw_cfg, net, fps) if len(fps) else []
+    memory_x = {
+        mem: settle_to_memory(redraw_cfg, net, np.array(mem, dtype=np.float32))
+        for mem in all_memories()
+    }
+    memory_x = memory_states_from_stable_fixed_points(memory_x, fps, fp_info)
+    transitions, detailed = make_transition_trajectories(redraw_cfg, net, memory_x)
+    plot_figure3(out_dir / "figure3_reproduction.png", redraw_cfg, net, transitions, detailed, fps, fp_info)
 
-    ax2 = fig.add_subplot(1, 2, 2, projection="3d")
-    for item in detailed:
-        pts = project(item["xs"], mean, comps).numpy()
-        inp = item["u"][:, 0].numpy()
-        color = "#2252c7" if abs(float(item["amp"]) - 1.0) < 1e-6 else "#52c7dc"
-        lw = 1.7 if color == "#2252c7" else 0.9
-        ax2.plot(pts[:, 2], inp, pts[:, 0], color=color, lw=lw, alpha=0.9)
-    ax2.set_xlabel("PC3")
-    ax2.set_ylabel("input 1")
-    ax2.set_zlabel("PC1")
-    ax2.set_title("Input-amplitude perturbation")
-    ax2.view_init(elev=20, azim=-48)
-
-    fig.suptitle(
-        f"Figure 3 reproduction: {len(fps)} fixed points "
-        f"({len(stable_idx)} stable, {len(saddle_idx)} saddles)",
-        fontsize=14,
+    stable_count = sum(1 for item in fp_info if item["unstable_count"] == 0)
+    saddle_count = sum(1 for item in fp_info if item["unstable_count"] == 1)
+    other_count = sum(1 for item in fp_info if item["unstable_count"] > 1)
+    print(
+        json.dumps(
+            {
+                "redraw_from_state": str(state_path),
+                "outputs": {
+                    "figure3_png": str(out_dir / "figure3_reproduction.png"),
+                    "figure3_pdf": str(out_dir / "figure3_reproduction.pdf") if redraw_cfg.save_pdf else None,
+                    "figure3_plot_data": str(out_dir / "figure3_plot_data.pt"),
+                },
+                "num_fixed_points": int(len(fps)),
+                "fixed_point_counts": {
+                    "stable": stable_count,
+                    "one_unstable": saddle_count,
+                    "more_than_one_unstable": other_count,
+                },
+                "figure3_view": {
+                    "left": [redraw_cfg.figure3_left_elev, redraw_cfg.figure3_left_azim],
+                    "right": [redraw_cfg.figure3_right_elev, redraw_cfg.figure3_right_azim],
+                },
+            },
+            indent=2,
+        )
     )
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    for field, value in asdict(Config()).items():
-        arg = "--" + field.replace("_", "-")
-        if isinstance(value, bool):
-            parser.add_argument(arg, action="store_true")
-        else:
-            parser.add_argument(arg, type=type(value), default=value)
-    args = parser.parse_args()
-    cfg = Config(**{k: getattr(args, k) for k in asdict(Config()).keys()})
+def redraw_figure3_from_plot_data(cfg: Config) -> None:
+    data_path = Path(cfg.redraw_from_plot_data)
+    data = torch.load(data_path, map_location="cpu", weights_only=False)
+    out_dir = Path(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    render_figure3_plot_data(out_dir / "figure3_reproduction.png", cfg, data)
+    print(
+        json.dumps(
+            {
+                "redraw_from_plot_data": str(data_path),
+                "outputs": {
+                    "figure3_png": str(out_dir / "figure3_reproduction.png"),
+                    "figure3_pdf": str(out_dir / "figure3_reproduction.pdf") if cfg.save_pdf else None,
+                },
+                "num_fixed_points": int(data["num_fixed_points"]),
+                "fixed_point_counts": {
+                    "stable": int(data["stable_count"]),
+                    "one_unstable": int(data["saddle_count"]),
+                    "more_than_one_unstable": int(data["other_count"]),
+                },
+                "figure3_view": {
+                    "left": [cfg.figure3_left_elev, cfg.figure3_left_azim],
+                    "right": [cfg.figure3_right_elev, cfg.figure3_right_azim],
+                },
+            },
+            indent=2,
+        )
+    )
+
+
+def run(cfg: Config) -> None:
+    torch_dtype(cfg)
+    if cfg.redraw_from_plot_data:
+        redraw_figure3_from_plot_data(cfg)
+        return
+    if cfg.redraw_from_state:
+        redraw_figure3_from_state(cfg)
+        return
+    device = resolve_device(cfg.device)
     set_seed(cfg.seed)
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(cfg.seed)
     net = init_network(cfg)
-    u_train, y_train = make_pulse_task(
-        cfg.train_steps,
-        cfg.pulse_width,
-        cfg.min_interval,
-        cfg.max_interval,
-        rng,
-    )
+    u_train, y_train = make_training_task(cfg, rng)
     losses = train_force(cfg, net, u_train, y_train)
 
     u_test, y_test = make_pulse_task(
@@ -527,35 +1202,78 @@ def main() -> None:
     xs_test, z_test, u_test = simulate(cfg, net, u_test)
     test_mse = float(torch.mean((z_test - y_test) ** 2))
 
-    memories = [tuple(int(v) for v in vals) for vals in np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1])).T.reshape(-1, 3)]
+    memories = all_memories()
     memory_x = {mem: settle_to_memory(cfg, net, np.array(mem, dtype=np.float32)) for mem in memories}
     transitions, detailed = make_transition_trajectories(cfg, net, memory_x)
 
     transition_states = torch.cat([item["xs"][::4] for item in transitions], dim=0)
     memory_states = torch.stack(list(memory_x.values()))
+    edge_states = make_edge_interpolation_initial_states(cfg, memory_x)
     midpoint_states = []
     for item in transitions:
         midpoint_states.append(item["xs"][cfg.pulse_width + 10])
         midpoint_states.append(item["xs"][cfg.pulse_width + 35])
-    fp_initial = torch.cat([transition_states, memory_states, torch.stack(midpoint_states), xs_test[::8]], dim=0)
+    fp_initial = torch.cat([transition_states, memory_states, edge_states, torch.stack(midpoint_states), xs_test[::8]], dim=0)
     fp_candidates, q_candidates = find_fixed_points(cfg, net, fp_initial)
+    critical_thresholds: list[dict[str, object]] = []
+    if cfg.critical_pulse_ics:
+        attractor_cfg = Config(**asdict(cfg))
+        attractor_cfg.fixed_point_q_thresh = max(cfg.fixed_point_q_thresh, cfg.critical_attractor_q_thresh)
+        prelim_fps, _ = cluster_fixed_points(fp_candidates, q_candidates, attractor_cfg)
+        prelim_info = classify_fixed_points(attractor_cfg, net, prelim_fps) if len(prelim_fps) else []
+        memory_x = memory_states_from_stable_fixed_points(memory_x, prelim_fps, prelim_info)
+        critical_states, critical_thresholds = make_critical_pulse_initial_states(cfg, net, memory_x)
+        if len(critical_states):
+            critical_candidates, critical_q = find_fixed_points(cfg, net, critical_states)
+            fp_candidates = torch.cat([fp_candidates, critical_candidates], dim=0)
+            q_candidates = torch.cat([q_candidates, critical_q], dim=0)
+        transitions, detailed = make_transition_trajectories(cfg, net, memory_x)
+
     fps, fp_q = cluster_fixed_points(fp_candidates, q_candidates, cfg)
     fp_info = classify_fixed_points(cfg, net, fps) if len(fps) else []
+    memory_x = memory_states_from_stable_fixed_points(memory_x, fps, fp_info)
+    transitions, detailed = make_transition_trajectories(cfg, net, memory_x)
+    behavior = validate_flipflop_behavior(cfg, net, memory_x)
 
     plot_figure2(out_dir / "figure2_reproduction.png", u_test, z_test, y_test, losses)
     if len(fps):
         plot_figure3(out_dir / "figure3_reproduction.png", cfg, net, transitions, detailed, fps, fp_info)
 
+    stable_count = sum(1 for item in fp_info if item["unstable_count"] == 0)
+    saddle_count = sum(1 for item in fp_info if item["unstable_count"] == 1)
+    other_count = sum(1 for item in fp_info if item["unstable_count"] > 1)
     summary = {
         "config": asdict(cfg),
+        "actual_device": str(device),
+        "cuda_available": torch.cuda.is_available(),
+        "paper_targets": {
+            "network_size": 1000,
+            "fixed_point_initial_conditions": 600,
+            "reported_distinct_fixed_points": 26,
+            "reported_memory_attractors": 8,
+            "reported_other_four_unstable_fixed_points": 2,
+            "one_bit_transition_trajectories": 24,
+            "edge_interpolation_initial_conditions": cfg.edge_interpolation_points * 12,
+            "critical_pulse_thresholds_found": len(critical_thresholds),
+        },
         "train_loss_samples": losses,
         "test_mse": test_mse,
         "num_fixed_points": int(len(fps)),
+        "fixed_point_counts": {
+            "stable": stable_count,
+            "one_unstable": saddle_count,
+            "more_than_one_unstable": other_count,
+        },
         "fixed_point_q": [float(v) for v in fp_q],
         "fixed_points": fixed_point_json_summary(fp_info),
+        "critical_pulse_thresholds": critical_thresholds,
+        "behavior": behavior,
         "outputs": {
-            "figure2": str(out_dir / "figure2_reproduction.png"),
-            "figure3": str(out_dir / "figure3_reproduction.png") if len(fps) else None,
+            "figure2_png": str(out_dir / "figure2_reproduction.png"),
+            "figure2_pdf": str(out_dir / "figure2_reproduction.pdf"),
+            "figure3_png": str(out_dir / "figure3_reproduction.png") if len(fps) else None,
+            "figure3_pdf": str(out_dir / "figure3_reproduction.pdf") if len(fps) else None,
+            "figure3_plot_data": str(out_dir / "figure3_plot_data.pt") if len(fps) else None,
         },
     }
     with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
@@ -565,13 +1283,36 @@ def main() -> None:
         {
             "config": asdict(cfg),
             "net": {k: v.detach().cpu() for k, v in net.items()},
+            "fixed_point_candidates": fp_candidates,
+            "fixed_point_candidate_q": q_candidates,
+            "critical_pulse_thresholds": critical_thresholds,
+            "behavior": behavior,
             "fixed_points": fps,
             "fixed_point_q": fp_q,
         },
         out_dir / "reproduction_state.pt",
     )
 
-    print(json.dumps({k: summary[k] for k in ["test_mse", "num_fixed_points", "outputs"]}, indent=2))
+    print(
+        json.dumps(
+            {
+                "actual_device": summary["actual_device"],
+                "test_mse": summary["test_mse"],
+                "behavior": {
+                    "memory_hold": f"{behavior['memory_hold_ok']}/{behavior['memory_hold_total']}",
+                    "one_bit_transition": f"{behavior['one_bit_transition_ok']}/{behavior['one_bit_transition_total']}",
+                },
+                "num_fixed_points": summary["num_fixed_points"],
+                "fixed_point_counts": summary["fixed_point_counts"],
+                "outputs": summary["outputs"],
+            },
+            indent=2,
+        )
+    )
+
+
+def main() -> None:
+    run(RUN_CONFIG)
 
 
 if __name__ == "__main__":

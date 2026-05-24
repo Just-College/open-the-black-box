@@ -1,0 +1,176 @@
+{
+  "saddle_connection_eps": 0.25,
+  "saddle_connection_steps": 3000,
+  "connected_saddles": 6,
+  "total_1d_saddles": 12,
+  "connections": [
+    {
+      "saddle_index": 3,
+      "minus_output": [
+        1,
+        -1,
+        -1
+      ],
+      "plus_output": [
+        1,
+        1,
+        -1
+      ],
+      "connects_two_attractors": true
+    },
+    {
+      "saddle_index": 7,
+      "minus_output": [
+        -1,
+        1,
+        1
+      ],
+      "plus_output": [
+        -1,
+        -1,
+        1
+      ],
+      "connects_two_attractors": true
+    },
+    {
+      "saddle_index": 10,
+      "minus_output": [
+        1,
+        -1,
+        1
+      ],
+      "plus_output": [
+        1,
+        -1,
+        1
+      ],
+      "connects_two_attractors": false
+    },
+    {
+      "saddle_index": 11,
+      "minus_output": [
+        -1,
+        -1,
+        1
+      ],
+      "plus_output": [
+        1,
+        -1,
+        1
+      ],
+      "connects_two_attractors": true
+    },
+    {
+      "saddle_index": 12,
+      "minus_output": [
+        -1,
+        1,
+        -1
+      ],
+      "plus_output": [
+        -1,
+        1,
+        -1
+      ],
+      "connects_two_attractors": false
+    },
+    {
+      "saddle_index": 14,
+      "minus_output": [
+        1,
+        1,
+        -1
+      ],
+      "plus_output": [
+        -1,
+        1,
+        -1
+      ],
+      "connects_two_attractors": true
+    },
+    {
+      "saddle_index": 15,
+      "minus_output": [
+        -1,
+        -1,
+        -1
+      ],
+      "plus_output": [
+        -1,
+        -1,
+        -1
+      ],
+      "connects_two_attractors": false
+    },
+    {
+      "saddle_index": 16,
+      "minus_output": [
+        -1,
+        1,
+        1
+      ],
+      "plus_output": [
+        1,
+        1,
+        1
+      ],
+      "connects_two_attractors": true
+    },
+    {
+      "saddle_index": 17,
+      "minus_output": [
+        -1,
+        -1,
+        -1
+      ],
+      "plus_output": [
+        -1,
+        1,
+        -1
+      ],
+      "connects_two_attractors": true
+    },
+    {
+      "saddle_index": 18,
+      "minus_output": [
+        1,
+        1,
+        1
+      ],
+      "plus_output": [
+        1,
+        1,
+        1
+      ],
+      "connects_two_attractors": false
+    },
+    {
+      "saddle_index": 19,
+      "minus_output": [
+        1,
+        -1,
+        1
+      ],
+      "plus_output": [
+        1,
+        -1,
+        1
+      ],
+      "connects_two_attractors": false
+    },
+    {
+      "saddle_index": 20,
+      "minus_output": [
+        -1,
+        1,
+        -1
+      ],
+      "plus_output": [
+        -1,
+        1,
+        -1
+      ],
+      "connects_two_attractors": false
+    }
+  ]
+}
