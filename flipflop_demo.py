@@ -1039,7 +1039,7 @@ def build_state_space_plot_data(
         for amp in np.linspace(0.0, 1.0, 11):
             u = torch.zeros(relax_steps, 3, dtype=net["j"].dtype)
             u[: cfg.pulse_width, bit] = pulse_sign * float(amp)
-            xs, _ = simulate(cfg, net, u, stable_by_memory[source])
+            xs, _, uu = simulate(cfg, net, u, stable_by_memory[source])
             pts = project(xs, mean, comps).detach().cpu()
             inp = torch.full((pts.shape[0],), float(amp), dtype=pts.dtype)
             coords = torch.stack([pts[:, 2], inp, pts[:, 0]], dim=1).to(torch.float32)
