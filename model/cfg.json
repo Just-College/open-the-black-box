@@ -5,6 +5,8 @@
     "dt": 0.1,
     "train_steps": 50000,
     "test_steps": 1200,
+    "train_task": "mixed",
+    "structured_fraction": 0.7,
     "pulse_width": 6,
     "min_interval": 22,
     "max_interval": 55,

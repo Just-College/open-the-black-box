@@ -36,6 +36,8 @@ class Config:
     dt: float = 0.1
     train_steps: int = 50000
     test_steps: int = 1200
+    train_task: str = "mixed"
+    structured_fraction: float = 0.7
     pulse_width: int = 6
     min_interval: int = 22
     max_interval: int = 55
@@ -239,6 +241,43 @@ def make_balanced_transition_task(
     return torch.from_numpy(np.stack(u_rows[:steps])), torch.from_numpy(
         np.stack(y_rows[:steps])
     )
+
+
+def make_training_task(cfg: Config, rng: np.random.Generator) -> tuple[torch.Tensor, torch.Tensor]:
+    if cfg.train_task == "random":
+        return make_pulse_task(
+            cfg.train_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng
+        )
+    if cfg.train_task == "structured":
+        return make_balanced_transition_task(
+            cfg.train_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng
+        )
+    if cfg.train_task == "mixed":
+        structured_steps = int(round(cfg.train_steps * cfg.structured_fraction))
+        structured_steps = min(max(structured_steps, 0), cfg.train_steps)
+        random_steps = cfg.train_steps - structured_steps
+        parts_u: list[torch.Tensor] = []
+        parts_y: list[torch.Tensor] = []
+        if structured_steps:
+            u_s, y_s = make_balanced_transition_task(
+                structured_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng
+            )
+            parts_u.append(u_s)
+            parts_y.append(y_s)
+        if random_steps:
+            initial_state = parts_y[-1][-1].numpy() if parts_y else None
+            u_r, y_r = make_pulse_task(
+                random_steps,
+                cfg.pulse_width,
+                cfg.min_interval,
+                cfg.max_interval,
+                rng,
+                initial_state,
+            )
+            parts_u.append(u_r)
+            parts_y.append(y_r)
+        return torch.cat(parts_u, dim=0), torch.cat(parts_y, dim=0)
+    raise ValueError("train_task must be one of: random, structured, mixed")
 
 
 def init_network(cfg: Config) -> dict[str, torch.Tensor]:
@@ -1251,9 +1290,7 @@ def run(cfg: Config) -> None:
 
     rng = np.random.default_rng(cfg.seed)
     net = init_network(cfg)
-    u_train, y_train = make_balanced_transition_task(
-        cfg.train_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng
-    )
+    u_train, y_train = make_training_task(cfg, rng)
     losses = train_force(cfg, net, u_train, y_train)
 
     u_test, y_test = make_pulse_task(
