@@ -1,13 +1,13 @@
-"""Reproduce Figures 2 and 3 from Sussillo & Barak (2013).
+"""Run the 3-bit flip-flop RNN teaching demo from Sussillo & Barak (2013).
 
 The script trains a 3-bit flip-flop echo-state RNN with FORCE/RLS-style
 updates to the readout weights, then searches fixed points in the zero-input
-autonomous dynamics and plots low-dimensional phase-space summaries.
+autonomous dynamics and plots task behavior plus low-dimensional state-space
+summaries.
 
-Set ``RUN_CONFIG.preset = "paper"`` for the closest reproduction of the paper settings
-described in ``ref.txt``: N=1000, 600 fixed-point initial conditions sampled
-from all one-bit transition trajectories, and a strict q minimization pass.
-Use ``RUN_CONFIG.preset = "smoke"`` for a quick runtime check.
+Use ``run_flipflop_demo.py`` as the course entrypoint. This module is
+kept as the shared implementation library for training, fixed-point analysis,
+cached data generation, and figure rendering helpers.
 """
 
 from __future__ import annotations
@@ -28,15 +28,15 @@ from scipy.optimize import minimize
 
 @dataclass
 class Config:
-    preset: str = "paper"
-    seed: int = 3
-    n: int = 1024
-    g: float = 1.5
+    preset: str = "full"
+    seed: int = 8
+    n: int = 512
+    g: float = 1.3
     dt: float = 0.1
     train_steps: int = 50000
     test_steps: int = 1200
-    train_task: str = "random"
-    structured_fraction: float = 0.65
+    train_task: str = "mixed"
+    structured_fraction: float = 0.7
     pulse_width: int = 6
     min_interval: int = 22
     max_interval: int = 55
@@ -44,41 +44,39 @@ class Config:
     feedback_scale: float = 1.0
     feedback_during_training: str = "output"
     rls_alpha: float = 1.0
-    rls_every: int = 2
+    rls_every: int = 1
     washout_steps: int = 150
     settle_steps: int = 260
     transition_relax_steps: int = 160
-    fixed_point_ics: int = 600
-    fixed_point_steps: int = 2500
+    fixed_point_ics: int = 1200
+    fixed_point_steps: int = 3000
     fixed_point_lr: float = 0.035
-    fixed_point_q_thresh: float = 1e-10
-    fixed_point_refine: int = 160
-    fixed_point_refine_iter: int = 400
+    fixed_point_q_thresh: float = 2.25e-5
+    fixed_point_refine: int = 360
+    fixed_point_refine_iter: int = 700
     edge_interpolation_points: int = 17
     critical_pulse_ics: bool = True
     critical_bisection_steps: int = 14
     critical_relax_extra: int = 120
     critical_candidate_stride: int = 2
     critical_attractor_q_thresh: float = 1e-5
-    cluster_distance: float = 0.35
+    cluster_distance: float = 0.4
     unstable_tol: float = 1e-3
     out_dir: str = "outputs"
     device: str = "auto"
-    dtype: str = "float32"
-    redraw_from_state: str = ""
+    dtype: str = "float64"
     redraw_from_plot_data: str = ""
-    save_pdf: bool = True
-    figure3_left_elev: float = 18.0
-    figure3_left_azim: float = -62.0
-    figure3_right_elev: float = 62.0
-    figure3_right_azim: float = -58.0
+    state_space_left_elev: float = 18.0
+    state_space_left_azim: float = -62.0
 
 
 PRESETS: dict[str, dict[str, object]] = {
-    "smoke": {
+    "full": {},
+    "dry_run": {
         "n": 96,
         "train_steps": 1500,
         "test_steps": 320,
+        "dtype": "float32",
         "rls_every": 1,
         "fixed_point_ics": 80,
         "fixed_point_steps": 300,
@@ -89,48 +87,13 @@ PRESETS: dict[str, dict[str, object]] = {
         "critical_pulse_ics": False,
         "cluster_distance": 0.55,
     },
-    "draft": {
-        "n": 256,
-        "train_steps": 20000,
-        "test_steps": 900,
-        "train_task": "mixed",
-        "rls_every": 1,
-        "fixed_point_ics": 240,
-        "fixed_point_steps": 1000,
-        "fixed_point_q_thresh": 1e-7,
-        "fixed_point_refine": 80,
-        "fixed_point_refine_iter": 220,
-        "edge_interpolation_points": 11,
-        "critical_pulse_ics": True,
-        "critical_bisection_steps": 10,
-        "critical_candidate_stride": 3,
-        "cluster_distance": 0.45,
-    },
-    "paper": {},
-    "strict": {
-        "seed": 8,
-        "n": 512,
-        "g": 1.3,
-        "train_steps": 50000,
-        "test_steps": 1200,
-        "train_task": "mixed",
-        "structured_fraction": 0.7,
-        "rls_every": 1,
-        "dtype": "float64",
-        "fixed_point_ics": 1200,
-        "fixed_point_steps": 3000,
-        "fixed_point_q_thresh": 2.25e-5,
-        "fixed_point_refine": 360,
-        "fixed_point_refine_iter": 700,
-        "cluster_distance": 0.4,
-    },
 }
 
 
-def make_config(preset: str = "paper", **overrides: object) -> Config:
+def make_config(preset: str = "full", **overrides: object) -> Config:
     """Build a run config from a named preset plus explicit Python overrides."""
     if preset not in PRESETS:
-        raise ValueError("preset must be one of: smoke, draft, paper, strict")
+        raise ValueError("preset must be one of: full, dry_run")
     values = asdict(Config(preset=preset))
     values.update(PRESETS[preset])
     values.update(overrides)
@@ -144,18 +107,27 @@ def config_from_mapping(values: dict[str, object]) -> Config:
     return Config(**clean)
 
 
-# Edit this object to choose the run mode and parameters. Outputs intentionally
-# come from this single explicit configuration block.
-RUN_CONFIG = make_config(
-    preset="strict",
-    out_dir="outputs",
-    redraw_from_plot_data="outputs/figure3_plot_data.pt",
-    figure3_left_elev=18.0,
-    figure3_left_azim=-62.0,
-    figure3_right_elev=62.0,
-    figure3_right_azim=-58.0,
-    save_pdf=True,
-)
+def save_config_json(cfg: Config, out_path: Path) -> None:
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(asdict(cfg), f, indent=2)
+
+
+def load_config_json(path: Path) -> Config:
+    with path.open("r", encoding="utf-8") as f:
+        return config_from_mapping(json.load(f))
+
+
+def save_model(net: dict[str, torch.Tensor], out_path: Path) -> None:
+    torch.save({key: value.detach().cpu() for key, value in net.items()}, out_path)
+
+
+def load_model(path: Path) -> dict[str, torch.Tensor]:
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(data, dict) and "net" in data:
+        data = data["net"]
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} does not contain a model state dictionary.")
+    return {key: value.detach().cpu() for key, value in data.items()}
 
 
 def set_seed(seed: int) -> None:
@@ -769,29 +741,49 @@ def classify_fixed_points(
     return out
 
 
-def fixed_point_json_summary(fp_info: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Drop eigenvectors from fixed-point metadata before JSON serialization."""
-    keep = []
-    for item in fp_info:
-        keep.append(
-            {
-                "index": item["index"],
-                "output": item["output"],
-                "memory": item["memory"],
-                "unstable_count": item["unstable_count"],
-                "eig_real_max": item["eig_real_max"],
-            }
-        )
-    return keep
-
-
-def save_figure(fig: plt.Figure, out_path: Path, save_pdf: bool = True) -> None:
+def save_figure(fig: plt.Figure, out_path: Path) -> None:
     fig.savefig(out_path, dpi=220)
-    if save_pdf:
-        fig.savefig(out_path.with_suffix(".pdf"))
 
 
-def plot_figure2(
+def add_flow_arrow(
+    ax: plt.Axes,
+    xy: np.ndarray,
+    color,
+    frac: float = 0.5,
+    size: float = 12.0,
+    lw: float = 1.2,
+) -> None:
+    """Add one tangent arrow at a fractional arc-length position."""
+    if len(xy) < 3:
+        return
+    segment_lengths = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    total_length = float(segment_lengths.sum())
+    if total_length < 1e-8:
+        return
+    target_length = np.clip(frac, 0.0, 1.0) * total_length
+    idx = int(np.searchsorted(np.cumsum(segment_lengths), target_length))
+    idx = max(0, min(len(xy) - 2, idx))
+    p0 = xy[idx]
+    p1 = xy[idx + 1]
+    if np.linalg.norm(p1 - p0) < 1e-8:
+        return
+    ax.annotate(
+        "",
+        xy=(p1[0], p1[1]),
+        xytext=(p0[0], p0[1]),
+        arrowprops=dict(
+            arrowstyle="->",
+            color=color,
+            lw=lw,
+            mutation_scale=size,
+            shrinkA=0,
+            shrinkB=0,
+        ),
+        zorder=5,
+    )
+
+
+def plot_task_behavior(
     out_path: Path,
     u: torch.Tensor,
     z: torch.Tensor,
@@ -842,12 +834,57 @@ def plot_figure2(
     ax2.set_title("Echo-state architecture")
     ax2.axis("off")
 
-    fig.suptitle("Figure 2: 3-bit flip-flop task", fontsize=14)
+    fig.suptitle("3-bit flip-flop task behavior", fontsize=14)
     save_figure(fig, out_path)
     plt.close(fig)
 
 
-def build_figure3_plot_data(
+def save_model_behavior_plot_data(
+    out_path: Path,
+    u: torch.Tensor,
+    z: torch.Tensor,
+    target: torch.Tensor,
+    train_losses: list[float],
+) -> None:
+    torch.save(
+        {
+            "u": u.detach().cpu().to(torch.float32),
+            "z": z.detach().cpu().to(torch.float32),
+            "target": target.detach().cpu().to(torch.float32),
+            "train_losses": [float(v) for v in train_losses],
+        },
+        out_path,
+    )
+
+
+def render_model_behavior_plot_data(out_path: Path, data: dict[str, object]) -> None:
+    plot_task_behavior(
+        out_path,
+        data["u"],
+        data["z"],
+        data["target"],
+        data["train_losses"],
+    )
+
+
+def render_model_behavior_from_model(out_path: Path, cfg_path: Path, model_path: Path) -> None:
+    cfg = load_config_json(cfg_path)
+    cfg.device = "cpu"
+    rng = np.random.default_rng(cfg.seed)
+    u, target = make_pulse_task(
+        cfg.test_steps,
+        cfg.pulse_width,
+        cfg.min_interval,
+        cfg.max_interval,
+        rng,
+    )
+    net = load_model(model_path)
+    _, z, u = simulate(cfg, net, u)
+    train_losses = [0.0]
+    plot_task_behavior(out_path, u, z, target, train_losses)
+
+
+def build_state_space_plot_data(
     cfg: Config,
     net: dict[str, torch.Tensor],
     transitions: list[dict[str, object]],
@@ -954,17 +991,20 @@ def build_figure3_plot_data(
         target = connected_example["target"]
         pulse_sign = float(connected_example["pulse_sign"])
         relax_steps = int(connected_example["relax_steps"])
+        saddle_point = connected_example["saddle"]
+        saddle_projected = project(saddle_point[None, :], mean, comps).detach().cpu()[0]
         for amp in np.linspace(0.0, 1.0, 11):
             u = torch.zeros(relax_steps, 3, dtype=net["j"].dtype)
             u[: cfg.pulse_width, bit] = pulse_sign * float(amp)
             xs, _, uu = simulate(cfg, net, u, stable_by_memory[source])
             pts = project(xs, mean, comps).detach().cpu()
-            inp = uu[:, bit].detach().cpu() * pulse_sign
+            inp = torch.full((pts.shape[0],), float(amp), dtype=pts.dtype)
             coords = torch.stack([pts[:, 2], inp, pts[:, 0]], dim=1).to(torch.float32)
             is_full = abs(float(amp) - 1.0) < 1e-6
             right_curves.append(
                 {
                     "coords": coords,
+                    "input_amplitude": float(amp),
                     "color": "#2252c7" if is_full else "#52c7dc",
                     "lw": 1.8 if is_full else 0.85,
                     "alpha": 0.9,
@@ -974,20 +1014,20 @@ def build_figure3_plot_data(
         for mem in (source, target):
             p = project(stable_by_memory[mem][None, :], mean, comps).detach().cpu()[0]
             right_points.append({"coords": torch.tensor([p[2], 0.0, p[0]], dtype=torch.float32), "kind": "stable"})
-        saddle_point = connected_example["saddle"]
-        p = project(saddle_point[None, :], mean, comps).detach().cpu()[0]
+        p = saddle_projected
         right_points.append({"coords": torch.tensor([p[2], 0.0, p[0]], dtype=torch.float32), "kind": "saddle"})
         right_ylabel = f"input {bit + 1}"
-        right_title = f"Input-driven transition {source} -> {target}"
+        right_title = f"Input-amplitude transition {source} -> {target}"
     else:
         for item in detailed:
             pts = project(item["xs"], mean, comps).detach().cpu()
-            inp = item["u"][:, 0].detach().cpu()
+            inp = torch.full((pts.shape[0],), float(item["amp"]), dtype=pts.dtype)
             coords = torch.stack([pts[:, 2], inp, pts[:, 0]], dim=1).to(torch.float32)
             is_full = abs(float(item["amp"]) - 1.0) < 1e-6
             right_curves.append(
                 {
                     "coords": coords,
+                    "input_amplitude": float(item["amp"]),
                     "color": "#2252c7" if is_full else "#52c7dc",
                     "lw": 1.7 if is_full else 0.9,
                     "alpha": 0.9,
@@ -1016,9 +1056,7 @@ def build_figure3_plot_data(
     }
 
 
-def render_figure3_plot_data(out_path: Path, cfg: Config, data: dict[str, object]) -> None:
-    fig = plt.figure(figsize=(13, 6), constrained_layout=True)
-    ax = fig.add_subplot(1, 2, 1, projection="3d")
+def draw_fixed_points_transition_panel(ax: plt.Axes, cfg: Config, data: dict[str, object]) -> None:
     left = data["left"]
     for pts_t in left["transition_curves"]:
         pts = pts_t.numpy()
@@ -1046,35 +1084,66 @@ def render_figure3_plot_data(out_path: Path, cfg: Config, data: dict[str, object
     ax.set_ylabel("PC2")
     ax.set_zlabel("PC3")
     ax.set_title("Fixed points and 1-bit transitions")
-    ax.view_init(elev=cfg.figure3_left_elev, azim=cfg.figure3_left_azim)
+    ax.view_init(elev=cfg.state_space_left_elev, azim=cfg.state_space_left_azim)
     ax.legend(loc="upper left", fontsize=8)
 
-    ax2 = fig.add_subplot(1, 2, 2, projection="3d")
+
+def draw_input_amplitude_state_space_panel(ax: plt.Axes, data: dict[str, object]) -> None:
     right = data["right"]
+    cmap = plt.get_cmap("viridis")
+    norm = matplotlib.colors.Normalize(vmin=0.0, vmax=1.0)
     for item in right["curves"]:
         pts = item["coords"].numpy()
-        ax2.plot(pts[:, 0], pts[:, 1], pts[:, 2], color=item["color"], lw=item["lw"], alpha=item["alpha"])
-    for item in right["points"]:
+        amp = float(item.get("input_amplitude", pts[0, 1]))
+        color = cmap(norm(amp))
+        xy = np.column_stack([pts[:, 0], pts[:, 2]])
+        ax.plot(xy[:, 0], xy[:, 1], color=color, lw=item["lw"], alpha=item["alpha"], zorder=2)
+        add_flow_arrow(
+            ax,
+            xy,
+            color=color,
+            frac=0.5,
+            size=12.0,
+            lw=1.2,
+        )
+    non_stable_points = [item for item in right["points"] if item["kind"] != "stable"]
+    stable_points = [item for item in right["points"] if item["kind"] == "stable"]
+    for item in non_stable_points + stable_points:
         p = item["coords"].numpy()
         color = "black" if item["kind"] == "stable" else "#2cbf31"
-        ax2.scatter([p[0]], [p[1]], [p[2]], marker="x", s=70, c=color, lw=2.0)
-    ax2.set_ylabel(right["ylabel"])
-    ax2.set_title(right["title"])
-    ax2.set_xlabel("PC3")
-    ax2.set_zlabel("PC1")
-    ax2.view_init(elev=cfg.figure3_right_elev, azim=cfg.figure3_right_azim)
+        zorder = 10 if item["kind"] == "stable" else 9
+        ax.scatter([p[0]], [p[2]], marker="x", s=70, c=color, lw=2.0, zorder=zorder)
+    ax.set_title(right["title"])
+    ax.set_xlabel("PC3")
+    ax.set_ylabel("PC1")
+    ax.grid(True, alpha=0.35)
+    colorbar = ax.figure.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, shrink=0.84, pad=0.03)
+    colorbar.set_label(right["ylabel"])
 
+
+def render_fixed_points_transition_plot_data(out_path: Path, cfg: Config, data: dict[str, object]) -> None:
+    fig = plt.figure(figsize=(7.2, 6.0), constrained_layout=True)
+    ax = fig.add_subplot(1, 1, 1, projection="3d")
+    draw_fixed_points_transition_panel(ax, cfg, data)
     fig.suptitle(
-        f"Figure 3: {data['num_fixed_points']} fixed points "
+        f"Fixed points: {data['num_fixed_points']} total "
         f"({data['stable_count']} stable, {data['saddle_count']} one-dimensional saddles)",
         fontsize=14,
     )
-    save_figure(fig, out_path, save_pdf=cfg.save_pdf)
+    save_figure(fig, out_path)
     plt.close(fig)
 
 
-def plot_figure3(
-    out_path: Path,
+def render_state_space_plot_data(out_path: Path, data: dict[str, object]) -> None:
+    fig = plt.figure(figsize=(7.4, 6.0), constrained_layout=True)
+    ax = fig.add_subplot(1, 1, 1)
+    draw_input_amplitude_state_space_panel(ax, data)
+    save_figure(fig, out_path)
+    plt.close(fig)
+
+
+def plot_state_space_analysis(
+    out_dir: Path,
     cfg: Config,
     net: dict[str, torch.Tensor],
     transitions: list[dict[str, object]],
@@ -1082,81 +1151,26 @@ def plot_figure3(
     fps: torch.Tensor,
     fp_info: list[dict[str, object]],
 ) -> None:
-    data = build_figure3_plot_data(cfg, net, transitions, detailed, fps, fp_info)
-    torch.save(data, out_path.with_name("figure3_plot_data.pt"))
-    render_figure3_plot_data(out_path, cfg, data)
+    data = build_state_space_plot_data(cfg, net, transitions, detailed, fps, fp_info)
+    torch.save(data, out_dir / "state_space_plot_data.pt")
+    render_fixed_points_transition_plot_data(out_dir / "fixed_points_1d_transition.png", cfg, data)
+    render_state_space_plot_data(out_dir / "state_space.png", data)
 
 
-def redraw_figure3_from_state(cfg: Config) -> None:
-    state_path = Path(cfg.redraw_from_state)
-    state = torch.load(state_path, map_location="cpu", weights_only=False)
-    state_cfg = config_from_mapping(state["config"])
-
-    values = asdict(state_cfg)
-    values["out_dir"] = cfg.out_dir
-    values["device"] = "cpu"
-    values["redraw_from_state"] = cfg.redraw_from_state
-    values["figure3_left_elev"] = cfg.figure3_left_elev
-    values["figure3_left_azim"] = cfg.figure3_left_azim
-    values["figure3_right_elev"] = cfg.figure3_right_elev
-    values["figure3_right_azim"] = cfg.figure3_right_azim
-    redraw_cfg = Config(**values)
-
-    out_dir = Path(redraw_cfg.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    net = {key: value.detach().cpu() for key, value in state["net"].items()}
-    fps = state["fixed_points"].detach().cpu()
-
-    fp_info = classify_fixed_points(redraw_cfg, net, fps) if len(fps) else []
-    memory_x = {
-        mem: settle_to_memory(redraw_cfg, net, np.array(mem, dtype=np.float32))
-        for mem in all_memories()
-    }
-    memory_x = memory_states_from_stable_fixed_points(memory_x, fps, fp_info)
-    transitions, detailed = make_transition_trajectories(redraw_cfg, net, memory_x)
-    plot_figure3(out_dir / "figure3_reproduction.png", redraw_cfg, net, transitions, detailed, fps, fp_info)
-
-    stable_count = sum(1 for item in fp_info if item["unstable_count"] == 0)
-    saddle_count = sum(1 for item in fp_info if item["unstable_count"] == 1)
-    other_count = sum(1 for item in fp_info if item["unstable_count"] > 1)
-    print(
-        json.dumps(
-            {
-                "redraw_from_state": str(state_path),
-                "outputs": {
-                    "figure3_png": str(out_dir / "figure3_reproduction.png"),
-                    "figure3_pdf": str(out_dir / "figure3_reproduction.pdf") if redraw_cfg.save_pdf else None,
-                    "figure3_plot_data": str(out_dir / "figure3_plot_data.pt"),
-                },
-                "num_fixed_points": int(len(fps)),
-                "fixed_point_counts": {
-                    "stable": stable_count,
-                    "one_unstable": saddle_count,
-                    "more_than_one_unstable": other_count,
-                },
-                "figure3_view": {
-                    "left": [redraw_cfg.figure3_left_elev, redraw_cfg.figure3_left_azim],
-                    "right": [redraw_cfg.figure3_right_elev, redraw_cfg.figure3_right_azim],
-                },
-            },
-            indent=2,
-        )
-    )
-
-
-def redraw_figure3_from_plot_data(cfg: Config) -> None:
+def redraw_state_space_from_plot_data(cfg: Config) -> None:
     data_path = Path(cfg.redraw_from_plot_data)
     data = torch.load(data_path, map_location="cpu", weights_only=False)
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    render_figure3_plot_data(out_dir / "figure3_reproduction.png", cfg, data)
+    render_fixed_points_transition_plot_data(out_dir / "fixed_points_1d_transition.png", cfg, data)
+    render_state_space_plot_data(out_dir / "state_space.png", data)
     print(
         json.dumps(
             {
                 "redraw_from_plot_data": str(data_path),
                 "outputs": {
-                    "figure3_png": str(out_dir / "figure3_reproduction.png"),
-                    "figure3_pdf": str(out_dir / "figure3_reproduction.pdf") if cfg.save_pdf else None,
+                    "fixed_points_transition_png": str(out_dir / "fixed_points_1d_transition.png"),
+                    "state_space_png": str(out_dir / "state_space.png"),
                 },
                 "num_fixed_points": int(data["num_fixed_points"]),
                 "fixed_point_counts": {
@@ -1164,9 +1178,8 @@ def redraw_figure3_from_plot_data(cfg: Config) -> None:
                     "one_unstable": int(data["saddle_count"]),
                     "more_than_one_unstable": int(data["other_count"]),
                 },
-                "figure3_view": {
-                    "left": [cfg.figure3_left_elev, cfg.figure3_left_azim],
-                    "right": [cfg.figure3_right_elev, cfg.figure3_right_azim],
+                "state_space_view": {
+                    "left": [cfg.state_space_left_elev, cfg.state_space_left_azim],
                 },
             },
             indent=2,
@@ -1177,10 +1190,7 @@ def redraw_figure3_from_plot_data(cfg: Config) -> None:
 def run(cfg: Config) -> None:
     torch_dtype(cfg)
     if cfg.redraw_from_plot_data:
-        redraw_figure3_from_plot_data(cfg)
-        return
-    if cfg.redraw_from_state:
-        redraw_figure3_from_state(cfg)
+        redraw_state_space_from_plot_data(cfg)
         return
     device = resolve_device(cfg.device)
     set_seed(cfg.seed)
@@ -1235,85 +1245,59 @@ def run(cfg: Config) -> None:
     transitions, detailed = make_transition_trajectories(cfg, net, memory_x)
     behavior = validate_flipflop_behavior(cfg, net, memory_x)
 
-    plot_figure2(out_dir / "figure2_reproduction.png", u_test, z_test, y_test, losses)
+    save_model_behavior_plot_data(out_dir / "model_behavior_plot_data.pt", u_test, z_test, y_test, losses)
+    plot_task_behavior(out_dir / "model_behavior.png", u_test, z_test, y_test, losses)
     if len(fps):
-        plot_figure3(out_dir / "figure3_reproduction.png", cfg, net, transitions, detailed, fps, fp_info)
+        plot_state_space_analysis(out_dir, cfg, net, transitions, detailed, fps, fp_info)
 
     stable_count = sum(1 for item in fp_info if item["unstable_count"] == 0)
     saddle_count = sum(1 for item in fp_info if item["unstable_count"] == 1)
     other_count = sum(1 for item in fp_info if item["unstable_count"] > 1)
-    summary = {
-        "config": asdict(cfg),
-        "actual_device": str(device),
-        "cuda_available": torch.cuda.is_available(),
-        "paper_targets": {
-            "network_size": 1000,
-            "fixed_point_initial_conditions": 600,
-            "reported_distinct_fixed_points": 26,
-            "reported_memory_attractors": 8,
-            "reported_other_four_unstable_fixed_points": 2,
-            "one_bit_transition_trajectories": 24,
-            "edge_interpolation_initial_conditions": cfg.edge_interpolation_points * 12,
-            "critical_pulse_thresholds_found": len(critical_thresholds),
-        },
-        "train_loss_samples": losses,
-        "test_mse": test_mse,
-        "num_fixed_points": int(len(fps)),
-        "fixed_point_counts": {
-            "stable": stable_count,
-            "one_unstable": saddle_count,
-            "more_than_one_unstable": other_count,
-        },
-        "fixed_point_q": [float(v) for v in fp_q],
-        "fixed_points": fixed_point_json_summary(fp_info),
-        "critical_pulse_thresholds": critical_thresholds,
-        "behavior": behavior,
-        "outputs": {
-            "figure2_png": str(out_dir / "figure2_reproduction.png"),
-            "figure2_pdf": str(out_dir / "figure2_reproduction.pdf"),
-            "figure3_png": str(out_dir / "figure3_reproduction.png") if len(fps) else None,
-            "figure3_pdf": str(out_dir / "figure3_reproduction.pdf") if len(fps) else None,
-            "figure3_plot_data": str(out_dir / "figure3_plot_data.pt") if len(fps) else None,
-        },
+    fixed_point_counts = {
+        "stable": stable_count,
+        "one_unstable": saddle_count,
+        "more_than_one_unstable": other_count,
     }
-    with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+    outputs = {
+        "cfg_json": str(out_dir / "cfg.json"),
+        "model_pt": str(out_dir / "model.pt"),
+        "model_behavior_png": str(out_dir / "model_behavior.png"),
+        "model_behavior_plot_data": str(out_dir / "model_behavior_plot_data.pt"),
+        "fixed_point_analysis_pt": str(out_dir / "fixed_point_analysis.pt") if len(fps) else None,
+        "fixed_points_transition_png": str(out_dir / "fixed_points_1d_transition.png") if len(fps) else None,
+        "state_space_png": str(out_dir / "state_space.png") if len(fps) else None,
+        "state_space_plot_data": str(out_dir / "state_space_plot_data.pt") if len(fps) else None,
+    }
 
-    torch.save(
-        {
-            "config": asdict(cfg),
-            "net": {k: v.detach().cpu() for k, v in net.items()},
-            "fixed_point_candidates": fp_candidates,
-            "fixed_point_candidate_q": q_candidates,
-            "critical_pulse_thresholds": critical_thresholds,
-            "behavior": behavior,
-            "fixed_points": fps,
-            "fixed_point_q": fp_q,
-        },
-        out_dir / "reproduction_state.pt",
-    )
+    save_config_json(cfg, out_dir / "cfg.json")
+    save_model(net, out_dir / "model.pt")
+    if len(fps):
+        torch.save(
+            {
+                "fixed_point_candidates": fp_candidates.detach().cpu(),
+                "fixed_point_candidate_q": q_candidates.detach().cpu(),
+                "critical_pulse_thresholds": critical_thresholds,
+                "behavior": behavior,
+                "fixed_points": fps.detach().cpu(),
+                "fixed_point_q": fp_q.detach().cpu(),
+                "fixed_point_counts": fixed_point_counts,
+            },
+            out_dir / "fixed_point_analysis.pt",
+        )
 
     print(
         json.dumps(
             {
-                "actual_device": summary["actual_device"],
-                "test_mse": summary["test_mse"],
+                "actual_device": str(device),
+                "test_mse": test_mse,
                 "behavior": {
                     "memory_hold": f"{behavior['memory_hold_ok']}/{behavior['memory_hold_total']}",
                     "one_bit_transition": f"{behavior['one_bit_transition_ok']}/{behavior['one_bit_transition_total']}",
                 },
-                "num_fixed_points": summary["num_fixed_points"],
-                "fixed_point_counts": summary["fixed_point_counts"],
-                "outputs": summary["outputs"],
+                "num_fixed_points": int(len(fps)),
+                "fixed_point_counts": fixed_point_counts,
+                "outputs": outputs,
             },
             indent=2,
         )
     )
-
-
-def main() -> None:
-    run(RUN_CONFIG)
-
-
-if __name__ == "__main__":
-    main()
