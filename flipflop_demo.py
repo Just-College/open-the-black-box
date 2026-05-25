@@ -21,6 +21,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
 import numpy as np
 import torch
 from scipy.optimize import minimize
@@ -769,7 +770,16 @@ def classify_fixed_points(
 
 
 def save_figure(fig: plt.Figure, out_path: Path) -> None:
-    fig.savefig(out_path, dpi=220)
+    fig.savefig(out_path, dpi=300)
+
+
+def trim_spines_to_ticks(ax: plt.Axes) -> None:
+    x_ticks = [tick for tick in ax.get_xticks() if ax.get_xlim()[0] <= tick <= ax.get_xlim()[1]]
+    y_ticks = [tick for tick in ax.get_yticks() if ax.get_ylim()[0] <= tick <= ax.get_ylim()[1]]
+    if len(x_ticks) >= 2:
+        ax.spines["bottom"].set_bounds(x_ticks[0], x_ticks[-1])
+    if len(y_ticks) >= 2:
+        ax.spines["left"].set_bounds(y_ticks[0], y_ticks[-1])
 
 
 def add_flow_arrow(
@@ -815,88 +825,35 @@ def plot_task_behavior(
     u: torch.Tensor,
     z: torch.Tensor,
     target: torch.Tensor,
-    train_losses: list[float],
 ) -> None:
     colors = [("#7f1515", "#ff2020"), ("#0f3b1d", "#19a35b"), ("#173a92", "#315fd6")]
     t = np.arange(u.shape[0])
-    fig = plt.figure(figsize=(12, 5.2), constrained_layout=True)
-    gs = fig.add_gridspec(1, 2, width_ratios=[1.35, 1.0])
-    ax = fig.add_subplot(gs[0, 0])
-    offsets = np.array([2.7, 0.0, -2.7])
+    fig = plt.figure(figsize=(7.2, 7.2))
+    offsets = np.array([3.6, 0.0, -3.6])
     for k, (dark, light) in enumerate(colors):
-        ax.plot(t, u[:, k].numpy() * 0.65 + offsets[k], color=dark, lw=1.4)
-        ax.plot(t, z[:, k].numpy() * 0.75 + offsets[k], color=light, lw=1.7)
-        ax.plot(
-            t, target[:, k].numpy() * 0.75 + offsets[k], color=light, lw=0.8, alpha=0.25
+        input_label = "input" if k == 0 else None
+        output_label = "output" if k == 0 else None
+        target_label = "target" if k == 0 else None
+        plt.plot(t, u[:, k].numpy() * 0.65 + offsets[k], color=dark, lw=1.4, label=input_label)
+        plt.plot(t, z[:, k].numpy() * 0.75 + offsets[k], color=light, lw=1.7, label=output_label)
+        plt.plot(
+            t,
+            target[:, k].numpy() * 0.75 + offsets[k],
+            color=light,
+            lw=0.8,
+            alpha=0.25,
+            label=target_label,
         )
-        ax.text(-35, offsets[k] + 0.72, "+1", fontsize=9, ha="right", va="center")
-        ax.text(-35, offsets[k] - 0.72, "-1", fontsize=9, ha="right", va="center")
-    ax.set_xlim(0, len(t) - 1)
-    ax.set_ylim(-4.0, 3.8)
-    ax.set_yticks([])
-    ax.set_xlabel("Time")
-    ax.set_title("Sample input/output traces")
-    ax.spines[["top", "right", "left"]].set_visible(False)
+        plt.text(-35, offsets[k] + 0.72, "+1", fontsize=9, ha="right", va="center")
+        plt.text(-35, offsets[k] - 0.72, "-1", fontsize=9, ha="right", va="center")
+    plt.xlim(0, len(t))
 
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax2.set_aspect("equal")
-    theta = np.linspace(0, 2 * np.pi, 120)
-    ax2.plot(0.45 * np.cos(theta), 0.45 * np.sin(theta), color="0.15", lw=2)
-    rng = np.random.default_rng(4)
-    pts = rng.normal(size=(28, 2))
-    pts = (
-        pts
-        / np.maximum(np.linalg.norm(pts, axis=1, keepdims=True), 1e-6)
-        * rng.uniform(0.05, 0.38, (28, 1))
-    )
-    ax2.scatter(
-        pts[:, 0], pts[:, 1], s=18, facecolor="#f1dc6b", edgecolor="0.35", zorder=3
-    )
-    for _ in range(34):
-        a, b = rng.choice(len(pts), size=2, replace=False)
-        ax2.plot(
-            [pts[a, 0], pts[b, 0]],
-            [pts[a, 1], pts[b, 1]],
-            color="0.65",
-            lw=0.6,
-            alpha=0.55,
-        )
-    for y0 in [-0.22, 0.0, 0.22]:
-        ax2.annotate(
-            "",
-            xy=(-0.45, y0),
-            xytext=(-0.92, y0),
-            arrowprops=dict(arrowstyle="->", lw=1.1),
-        )
-        ax2.scatter([-1.0], [y0], s=55, facecolor="#f1dc6b", edgecolor="0.25")
-    for y0 in [-0.25, 0.0, 0.25]:
-        ax2.annotate(
-            "",
-            xy=(0.88, y0),
-            xytext=(0.45, y0),
-            arrowprops=dict(arrowstyle="->", lw=1.1),
-        )
-        ax2.scatter([1.0], [y0], s=72, facecolor="white", edgecolor="red", lw=1.4)
-    ax2.plot([1.08, 1.08, 0.25], [0.25, -0.48, -0.48], color="0.15", lw=1.7)
-    ax2.annotate(
-        "",
-        xy=(0.25, -0.45),
-        xytext=(0.25, -0.6),
-        arrowprops=dict(arrowstyle="->", lw=1.0),
-    )
-    ax2.text(
-        0,
-        -0.72,
-        f"FORCE/RLS readout training\nlast trace MSE={train_losses[-1]:.2e}",
-        ha="center",
-        fontsize=9,
-    )
-    ax2.set_xlim(-1.25, 1.25)
-    ax2.set_ylim(-0.95, 0.78)
-    ax2.set_title("Echo-state architecture")
-    ax2.axis("off")
+    plt.yticks([])
+    plt.xlabel("Time")
+    plt.title("3-bit flip-flop task behavior", pad=24)
+    plt.legend(loc="upper right", bbox_to_anchor=(1.05, 1.05))
+    plt.gca().spines[["top", "right", "left"]].set_visible(False)
 
-    fig.suptitle("3-bit flip-flop task behavior", fontsize=14)
     save_figure(fig, out_path)
     plt.close(fig)
 
@@ -921,7 +878,7 @@ def save_model_behavior_plot_data(
 
 def render_model_behavior_plot_data(out_path: Path, data: dict[str, object]) -> None:
     plot_task_behavior(
-        out_path, data["u"], data["z"], data["target"], data["train_losses"]
+        out_path, data["u"], data["z"], data["target"]
     )
 
 
@@ -936,8 +893,7 @@ def render_model_behavior_from_model(
     )
     net = load_model(model_path)
     _, z, u = simulate(cfg, net, u)
-    train_losses = [0.0]
-    plot_task_behavior(out_path, u, z, target, train_losses)
+    plot_task_behavior(out_path, u, z, target)
 
 
 def build_state_space_plot_data(
@@ -1159,14 +1115,25 @@ def draw_fixed_points_transition_panel(
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
     ax.set_zlabel("PC3")
-    ax.set_title("Fixed points and 1-bit transitions")
+    ax.set_title("Fixed points and 1-bit transitions", pad=24)
     ax.view_init(elev=elev, azim=azim)
-    ax.legend(loc="upper left", fontsize=8)
+    ax.grid(visible=False)
+    ax.legend(loc="upper left", fontsize=10)
 
 
-def draw_input_amplitude_state_space_panel(
-    ax: plt.Axes, data: dict[str, object]
+def render_fixed_points_transition_plot_data(
+    out_path: Path, data: dict[str, object], elev: float = 18.0, azim: float = -62.0
 ) -> None:
+    fig = plt.figure(figsize=(7.2, 6.0))
+    ax = fig.add_subplot(1, 1, 1, projection="3d")
+    draw_fixed_points_transition_panel(ax, data, elev=elev, azim=azim)
+    save_figure(fig, out_path)
+    plt.close(fig)
+
+
+def render_state_space_plot_data(out_path: Path, data: dict[str, object]) -> None:
+    fig = plt.figure(figsize=(7.4, 6.0))
+    ax = fig.add_axes([0.10, 0.12, 0.72, 0.78])
     right = data["right"]
     cmap = plt.get_cmap("viridis")
     norm = matplotlib.colors.Normalize(vmin=0.0, vmax=1.0)
@@ -1184,6 +1151,7 @@ def draw_input_amplitude_state_space_panel(
             zorder=2,
         )
         add_flow_arrow(ax, xy, color=color, frac=0.5, size=12.0, lw=1.2)
+
     non_stable_points = [item for item in right["points"] if item["kind"] != "stable"]
     stable_points = [item for item in right["points"] if item["kind"] == "stable"]
     for item in non_stable_points + stable_points:
@@ -1191,35 +1159,21 @@ def draw_input_amplitude_state_space_panel(
         color = "black" if item["kind"] == "stable" else "#2cbf31"
         zorder = 10 if item["kind"] == "stable" else 9
         ax.scatter([p[0]], [p[2]], marker="x", s=70, c=color, lw=2.0, zorder=zorder)
-    ax.set_title(right["title"])
+
+    ax.set_title(right["title"], pad=12)
     ax.set_xlabel("PC3")
     ax.set_ylabel("PC1")
-    ax.grid(True, alpha=0.35)
-    colorbar = ax.figure.colorbar(
-        matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, shrink=0.84, pad=0.03
-    )
-    colorbar.set_label(right["ylabel"])
+    ax.xaxis.set_major_locator(MultipleLocator(1.0))
+    ax.yaxis.set_major_locator(MultipleLocator(3.0))
 
+    ax.spines[["top", "right"]].set_visible(False)
+    trim_spines_to_ticks(ax)
 
-def render_fixed_points_transition_plot_data(
-    out_path: Path, data: dict[str, object], elev: float = 18.0, azim: float = -62.0
-) -> None:
-    fig = plt.figure(figsize=(7.2, 6.0), constrained_layout=True)
-    ax = fig.add_subplot(1, 1, 1, projection="3d")
-    draw_fixed_points_transition_panel(ax, data, elev=elev, azim=azim)
-    fig.suptitle(
-        f"Fixed points: {data['num_fixed_points']} total "
-        f"({data['stable_count']} stable, {data['saddle_count']} one-dimensional saddles)",
-        fontsize=14,
-    )
-    save_figure(fig, out_path)
-    plt.close(fig)
+    cax = fig.add_axes([0.89, 0.18, 0.03, 0.66])
+    colorbar = fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), cax=cax)
+    colorbar.ax.set_title("input", pad=16)
+    colorbar.ax.yaxis.set_ticks_position("right")
 
-
-def render_state_space_plot_data(out_path: Path, data: dict[str, object]) -> None:
-    fig = plt.figure(figsize=(7.4, 6.0), constrained_layout=True)
-    ax = fig.add_subplot(1, 1, 1)
-    draw_input_amplitude_state_space_panel(ax, data)
     save_figure(fig, out_path)
     plt.close(fig)
 
@@ -1360,7 +1314,7 @@ def run(cfg: Config) -> None:
         model_dir / "model_behavior_plot_data.pt", u_test, z_test, y_test, losses
     )
     plot_task_behavior(
-        figure_dir / "model_behavior.png", u_test, z_test, y_test, losses
+        figure_dir / "model_behavior.png", u_test, z_test, y_test
     )
     if len(fps):
         plot_state_space_analysis(
