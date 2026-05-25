@@ -19,6 +19,7 @@ class PlotConfig:
     cfg: str = "model/cfg.json"
     model: str = "model/model.pt"
     out: str = "figure/model_behavior.png"
+    show: bool = False
 
 
 # Edit this object to change input/output paths.
@@ -33,9 +34,11 @@ def main() -> None:
 
     if plot_data_path.exists():
         data = torch.load(plot_data_path, map_location="cpu", weights_only=False)
-        render_model_behavior_plot_data(out_path, data)
+        render_model_behavior_plot_data(out_path, data, show=cfg.show)
     else:
-        render_model_behavior_from_model(out_path, Path(cfg.cfg), Path(cfg.model))
+        render_model_behavior_from_model(
+            out_path, Path(cfg.cfg), Path(cfg.model), show=cfg.show
+        )
     print(f"Saved model behavior figure: {out_path}")
 
 

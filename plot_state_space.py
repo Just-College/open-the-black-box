@@ -14,6 +14,7 @@ from flipflop_demo import render_state_space_plot_data
 class PlotConfig:
     plot_data: str = "model/state_space_plot_data.pt"
     out: str = "figure/state_space.png"
+    show: bool = False
 
 
 # Edit this object to change input/output paths.
@@ -30,7 +31,7 @@ def main() -> None:
     data = torch.load(data_path, map_location="cpu", weights_only=False)
     out_path = Path(cfg.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    render_state_space_plot_data(out_path, data)
+    render_state_space_plot_data(out_path, data, show=cfg.show)
     print(f"Saved state-space figure: {out_path}")
 
 

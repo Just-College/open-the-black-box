@@ -16,6 +16,7 @@ class PlotConfig:
     out: str = "figure/fixed_points_1d_transition.png"
     fixed_points_elev: float = 18.0
     fixed_points_azim: float = -62.0
+    show: bool = False
 
 
 # Edit this object to change input/output paths.
@@ -33,7 +34,11 @@ def main() -> None:
     out_path = Path(cfg.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     render_fixed_points_transition_plot_data(
-        out_path, data, elev=cfg.fixed_points_elev, azim=cfg.fixed_points_azim
+        out_path,
+        data,
+        elev=cfg.fixed_points_elev,
+        azim=cfg.fixed_points_azim,
+        show=cfg.show,
     )
     print(f"Saved fixed-points figure: {out_path}")
 

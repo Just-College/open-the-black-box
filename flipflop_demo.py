@@ -14,12 +14,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 import matplotlib
 
-matplotlib.use("Agg")
+if (
+    "MPLBACKEND" not in os.environ
+    and "DISPLAY" not in os.environ
+    and "WAYLAND_DISPLAY" not in os.environ
+):
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 import numpy as np
@@ -244,7 +250,9 @@ def make_balanced_transition_task(
     )
 
 
-def make_training_task(cfg: Config, rng: np.random.Generator) -> tuple[torch.Tensor, torch.Tensor]:
+def make_training_task(
+    cfg: Config, rng: np.random.Generator
+) -> tuple[torch.Tensor, torch.Tensor]:
     if cfg.train_task == "random":
         return make_pulse_task(
             cfg.train_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng
@@ -261,7 +269,11 @@ def make_training_task(cfg: Config, rng: np.random.Generator) -> tuple[torch.Ten
         parts_y: list[torch.Tensor] = []
         if structured_steps:
             u_s, y_s = make_balanced_transition_task(
-                structured_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng
+                structured_steps,
+                cfg.pulse_width,
+                cfg.min_interval,
+                cfg.max_interval,
+                rng,
             )
             parts_u.append(u_s)
             parts_y.append(y_s)
@@ -769,13 +781,19 @@ def classify_fixed_points(
     return out
 
 
-def save_figure(fig: plt.Figure, out_path: Path) -> None:
+def save_figure(fig: plt.Figure, out_path: Path, show: bool = False) -> None:
     fig.savefig(out_path, dpi=300)
+    if show:
+        plt.show()
 
 
 def trim_spines_to_ticks(ax: plt.Axes) -> None:
-    x_ticks = [tick for tick in ax.get_xticks() if ax.get_xlim()[0] <= tick <= ax.get_xlim()[1]]
-    y_ticks = [tick for tick in ax.get_yticks() if ax.get_ylim()[0] <= tick <= ax.get_ylim()[1]]
+    x_ticks = [
+        tick for tick in ax.get_xticks() if ax.get_xlim()[0] <= tick <= ax.get_xlim()[1]
+    ]
+    y_ticks = [
+        tick for tick in ax.get_yticks() if ax.get_ylim()[0] <= tick <= ax.get_ylim()[1]
+    ]
     if len(x_ticks) >= 2:
         ax.spines["bottom"].set_bounds(x_ticks[0], x_ticks[-1])
     if len(y_ticks) >= 2:
@@ -825,6 +843,7 @@ def plot_task_behavior(
     u: torch.Tensor,
     z: torch.Tensor,
     target: torch.Tensor,
+    show: bool = False,
 ) -> None:
     colors = [("#7f1515", "#ff2020"), ("#0f3b1d", "#19a35b"), ("#173a92", "#315fd6")]
     t = np.arange(u.shape[0])
@@ -834,8 +853,20 @@ def plot_task_behavior(
         input_label = "input" if k == 0 else None
         output_label = "output" if k == 0 else None
         target_label = "target" if k == 0 else None
-        plt.plot(t, u[:, k].numpy() * 0.65 + offsets[k], color=dark, lw=1.4, label=input_label)
-        plt.plot(t, z[:, k].numpy() * 0.75 + offsets[k], color=light, lw=1.7, label=output_label)
+        plt.plot(
+            t,
+            u[:, k].numpy() * 0.65 + offsets[k],
+            color=dark,
+            lw=1.4,
+            label=input_label,
+        )
+        plt.plot(
+            t,
+            z[:, k].numpy() * 0.75 + offsets[k],
+            color=light,
+            lw=1.7,
+            label=output_label,
+        )
         plt.plot(
             t,
             target[:, k].numpy() * 0.75 + offsets[k],
@@ -854,7 +885,7 @@ def plot_task_behavior(
     plt.legend(loc="upper right", bbox_to_anchor=(1.05, 1.05))
     plt.gca().spines[["top", "right", "left"]].set_visible(False)
 
-    save_figure(fig, out_path)
+    save_figure(fig, out_path, show=show)
     plt.close(fig)
 
 
@@ -876,14 +907,14 @@ def save_model_behavior_plot_data(
     )
 
 
-def render_model_behavior_plot_data(out_path: Path, data: dict[str, object]) -> None:
-    plot_task_behavior(
-        out_path, data["u"], data["z"], data["target"]
-    )
+def render_model_behavior_plot_data(
+    out_path: Path, data: dict[str, object], show: bool = False
+) -> None:
+    plot_task_behavior(out_path, data["u"], data["z"], data["target"], show=show)
 
 
 def render_model_behavior_from_model(
-    out_path: Path, cfg_path: Path, model_path: Path
+    out_path: Path, cfg_path: Path, model_path: Path, show: bool = False
 ) -> None:
     cfg = load_config_json(cfg_path)
     cfg.device = "cpu"
@@ -893,7 +924,7 @@ def render_model_behavior_from_model(
     )
     net = load_model(model_path)
     _, z, u = simulate(cfg, net, u)
-    plot_task_behavior(out_path, u, z, target)
+    plot_task_behavior(out_path, u, z, target, show=show)
 
 
 def build_state_space_plot_data(
@@ -1122,16 +1153,22 @@ def draw_fixed_points_transition_panel(
 
 
 def render_fixed_points_transition_plot_data(
-    out_path: Path, data: dict[str, object], elev: float = 18.0, azim: float = -62.0
+    out_path: Path,
+    data: dict[str, object],
+    elev: float = 18.0,
+    azim: float = -62.0,
+    show: bool = False,
 ) -> None:
     fig = plt.figure(figsize=(7.2, 6.0))
     ax = fig.add_subplot(1, 1, 1, projection="3d")
     draw_fixed_points_transition_panel(ax, data, elev=elev, azim=azim)
-    save_figure(fig, out_path)
+    save_figure(fig, out_path, show=show)
     plt.close(fig)
 
 
-def render_state_space_plot_data(out_path: Path, data: dict[str, object]) -> None:
+def render_state_space_plot_data(
+    out_path: Path, data: dict[str, object], show: bool = False
+) -> None:
     fig = plt.figure(figsize=(7.4, 6.0))
     ax = fig.add_axes([0.10, 0.12, 0.72, 0.78])
     right = data["right"]
@@ -1174,7 +1211,7 @@ def render_state_space_plot_data(out_path: Path, data: dict[str, object]) -> Non
     colorbar.ax.set_title("input", pad=16)
     colorbar.ax.yaxis.set_ticks_position("right")
 
-    save_figure(fig, out_path)
+    save_figure(fig, out_path, show=show)
     plt.close(fig)
 
 
@@ -1313,9 +1350,7 @@ def run(cfg: Config) -> None:
     save_model_behavior_plot_data(
         model_dir / "model_behavior_plot_data.pt", u_test, z_test, y_test, losses
     )
-    plot_task_behavior(
-        figure_dir / "model_behavior.png", u_test, z_test, y_test
-    )
+    plot_task_behavior(figure_dir / "model_behavior.png", u_test, z_test, y_test)
     if len(fps):
         plot_state_space_analysis(
             model_dir, figure_dir, cfg, net, transitions, detailed, fps, fp_info
