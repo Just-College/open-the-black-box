@@ -12,8 +12,8 @@ from flipflop_demo import render_state_space_plot_data
 
 @dataclass(frozen=True)
 class PlotConfig:
-    plot_data: str = "outputs/state_space_plot_data.pt"
-    out: str = "outputs/state_space.png"
+    plot_data: str = "model/state_space_plot_data.pt"
+    out: str = "figure/state_space.png"
 
 
 # Edit this object to change input/output paths.

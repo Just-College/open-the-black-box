@@ -62,7 +62,8 @@ class Config:
     critical_attractor_q_thresh: float = 1e-5
     cluster_distance: float = 0.4
     unstable_tol: float = 1e-3
-    out_dir: str = "outputs"
+    model_dir: str = "model"
+    figure_dir: str = "figure"
     device: str = "auto"
     dtype: str = "float64"
     redraw_from_plot_data: str = ""
@@ -109,7 +110,7 @@ def config_from_mapping(values: dict[str, object]) -> Config:
 
 def save_config_json(cfg: Config, out_path: Path) -> None:
     with out_path.open("w", encoding="utf-8") as f:
-        json.dump(asdict(cfg), f, indent=2)
+        json.dump(asdict(cfg), f, indent=4)
 
 
 def load_config_json(path: Path) -> Config:
@@ -1143,7 +1144,8 @@ def render_state_space_plot_data(out_path: Path, data: dict[str, object]) -> Non
 
 
 def plot_state_space_analysis(
-    out_dir: Path,
+    model_dir: Path,
+    figure_dir: Path,
     cfg: Config,
     net: dict[str, torch.Tensor],
     transitions: list[dict[str, object]],
@@ -1152,25 +1154,25 @@ def plot_state_space_analysis(
     fp_info: list[dict[str, object]],
 ) -> None:
     data = build_state_space_plot_data(cfg, net, transitions, detailed, fps, fp_info)
-    torch.save(data, out_dir / "state_space_plot_data.pt")
-    render_fixed_points_transition_plot_data(out_dir / "fixed_points_1d_transition.png", cfg, data)
-    render_state_space_plot_data(out_dir / "state_space.png", data)
+    torch.save(data, model_dir / "state_space_plot_data.pt")
+    render_fixed_points_transition_plot_data(figure_dir / "fixed_points_1d_transition.png", cfg, data)
+    render_state_space_plot_data(figure_dir / "state_space.png", data)
 
 
 def redraw_state_space_from_plot_data(cfg: Config) -> None:
     data_path = Path(cfg.redraw_from_plot_data)
     data = torch.load(data_path, map_location="cpu", weights_only=False)
-    out_dir = Path(cfg.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    render_fixed_points_transition_plot_data(out_dir / "fixed_points_1d_transition.png", cfg, data)
-    render_state_space_plot_data(out_dir / "state_space.png", data)
+    figure_dir = Path(cfg.figure_dir)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    render_fixed_points_transition_plot_data(figure_dir / "fixed_points_1d_transition.png", cfg, data)
+    render_state_space_plot_data(figure_dir / "state_space.png", data)
     print(
         json.dumps(
             {
                 "redraw_from_plot_data": str(data_path),
                 "outputs": {
-                    "fixed_points_transition_png": str(out_dir / "fixed_points_1d_transition.png"),
-                    "state_space_png": str(out_dir / "state_space.png"),
+                    "fixed_points_transition_png": str(figure_dir / "fixed_points_1d_transition.png"),
+                    "state_space_png": str(figure_dir / "state_space.png"),
                 },
                 "num_fixed_points": int(data["num_fixed_points"]),
                 "fixed_point_counts": {
@@ -1194,8 +1196,10 @@ def run(cfg: Config) -> None:
         return
     device = resolve_device(cfg.device)
     set_seed(cfg.seed)
-    out_dir = Path(cfg.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = Path(cfg.model_dir)
+    figure_dir = Path(cfg.figure_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    figure_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(cfg.seed)
     net = init_network(cfg)
@@ -1245,10 +1249,10 @@ def run(cfg: Config) -> None:
     transitions, detailed = make_transition_trajectories(cfg, net, memory_x)
     behavior = validate_flipflop_behavior(cfg, net, memory_x)
 
-    save_model_behavior_plot_data(out_dir / "model_behavior_plot_data.pt", u_test, z_test, y_test, losses)
-    plot_task_behavior(out_dir / "model_behavior.png", u_test, z_test, y_test, losses)
+    save_model_behavior_plot_data(model_dir / "model_behavior_plot_data.pt", u_test, z_test, y_test, losses)
+    plot_task_behavior(figure_dir / "model_behavior.png", u_test, z_test, y_test, losses)
     if len(fps):
-        plot_state_space_analysis(out_dir, cfg, net, transitions, detailed, fps, fp_info)
+        plot_state_space_analysis(model_dir, figure_dir, cfg, net, transitions, detailed, fps, fp_info)
 
     stable_count = sum(1 for item in fp_info if item["unstable_count"] == 0)
     saddle_count = sum(1 for item in fp_info if item["unstable_count"] == 1)
@@ -1259,18 +1263,18 @@ def run(cfg: Config) -> None:
         "more_than_one_unstable": other_count,
     }
     outputs = {
-        "cfg_json": str(out_dir / "cfg.json"),
-        "model_pt": str(out_dir / "model.pt"),
-        "model_behavior_png": str(out_dir / "model_behavior.png"),
-        "model_behavior_plot_data": str(out_dir / "model_behavior_plot_data.pt"),
-        "fixed_point_analysis_pt": str(out_dir / "fixed_point_analysis.pt") if len(fps) else None,
-        "fixed_points_transition_png": str(out_dir / "fixed_points_1d_transition.png") if len(fps) else None,
-        "state_space_png": str(out_dir / "state_space.png") if len(fps) else None,
-        "state_space_plot_data": str(out_dir / "state_space_plot_data.pt") if len(fps) else None,
+        "cfg_json": str(model_dir / "cfg.json"),
+        "model_pt": str(model_dir / "model.pt"),
+        "model_behavior_plot_data": str(model_dir / "model_behavior_plot_data.pt"),
+        "fixed_point_analysis_pt": str(model_dir / "fixed_point_analysis.pt") if len(fps) else None,
+        "state_space_plot_data": str(model_dir / "state_space_plot_data.pt") if len(fps) else None,
+        "model_behavior_png": str(figure_dir / "model_behavior.png"),
+        "fixed_points_transition_png": str(figure_dir / "fixed_points_1d_transition.png") if len(fps) else None,
+        "state_space_png": str(figure_dir / "state_space.png") if len(fps) else None,
     }
 
-    save_config_json(cfg, out_dir / "cfg.json")
-    save_model(net, out_dir / "model.pt")
+    save_config_json(cfg, model_dir / "cfg.json")
+    save_model(net, model_dir / "model.pt")
     if len(fps):
         torch.save(
             {
@@ -1282,7 +1286,7 @@ def run(cfg: Config) -> None:
                 "fixed_point_q": fp_q.detach().cpu(),
                 "fixed_point_counts": fixed_point_counts,
             },
-            out_dir / "fixed_point_analysis.pt",
+            model_dir / "fixed_point_analysis.pt",
         )
 
     print(

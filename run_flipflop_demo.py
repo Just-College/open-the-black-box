@@ -7,8 +7,9 @@ from flipflop_demo import make_config, run
 # this file the only training/analysis entrypoint.
 RUN_CONFIG = make_config(
     preset="full",
-    out_dir="outputs",
-    redraw_from_plot_data="outputs/state_space_plot_data.pt",
+    model_dir="model",
+    figure_dir="figure",
+    redraw_from_plot_data="model/state_space_plot_data.pt",
     state_space_left_elev=18.0,
     state_space_left_azim=-62.0,
 )

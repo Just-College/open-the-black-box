@@ -12,8 +12,8 @@ from flipflop_demo import make_config, render_fixed_points_transition_plot_data
 
 @dataclass(frozen=True)
 class PlotConfig:
-    plot_data: str = "outputs/state_space_plot_data.pt"
-    out: str = "outputs/fixed_points_1d_transition.png"
+    plot_data: str = "model/state_space_plot_data.pt"
+    out: str = "figure/fixed_points_1d_transition.png"
     state_space_left_elev: float = 18.0
     state_space_left_azim: float = -62.0
 

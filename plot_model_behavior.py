@@ -12,10 +12,10 @@ from flipflop_demo import render_model_behavior_from_model, render_model_behavio
 
 @dataclass(frozen=True)
 class PlotConfig:
-    plot_data: str = "outputs/model_behavior_plot_data.pt"
-    cfg: str = "outputs/cfg.json"
-    model: str = "outputs/model.pt"
-    out: str = "outputs/model_behavior.png"
+    plot_data: str = "model/model_behavior_plot_data.pt"
+    cfg: str = "model/cfg.json"
+    model: str = "model/model.pt"
+    out: str = "figure/model_behavior.png"
 
 
 # Edit this object to change input/output paths.
