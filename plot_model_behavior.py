@@ -7,7 +7,10 @@ from pathlib import Path
 
 import torch
 
-from flipflop_demo import render_model_behavior_from_model, render_model_behavior_plot_data
+from flipflop_demo import (
+    render_model_behavior_from_model,
+    render_model_behavior_plot_data,
+)
 
 
 @dataclass(frozen=True)

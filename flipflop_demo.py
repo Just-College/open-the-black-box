@@ -25,24 +25,22 @@ import numpy as np
 import torch
 from scipy.optimize import minimize
 
+NETWORK_DTYPE = torch.float64
+
 
 @dataclass
 class Config:
-    preset: str = "full"
     seed: int = 8
     n: int = 512
     g: float = 1.3
     dt: float = 0.1
     train_steps: int = 50000
     test_steps: int = 1200
-    train_task: str = "mixed"
-    structured_fraction: float = 0.7
     pulse_width: int = 6
     min_interval: int = 22
     max_interval: int = 55
     input_scale: float = 1.0
     feedback_scale: float = 1.0
-    feedback_during_training: str = "output"
     rls_alpha: float = 1.0
     rls_every: int = 1
     washout_steps: int = 150
@@ -65,19 +63,14 @@ class Config:
     model_dir: str = "model"
     figure_dir: str = "figure"
     device: str = "auto"
-    dtype: str = "float64"
-    redraw_from_plot_data: str = ""
-    state_space_left_elev: float = 18.0
-    state_space_left_azim: float = -62.0
 
 
 PRESETS: dict[str, dict[str, object]] = {
     "full": {},
-    "dry_run": {
+    "test": {
         "n": 96,
         "train_steps": 1500,
         "test_steps": 320,
-        "dtype": "float32",
         "rls_every": 1,
         "fixed_point_ics": 80,
         "fixed_point_steps": 300,
@@ -94,8 +87,8 @@ PRESETS: dict[str, dict[str, object]] = {
 def make_config(preset: str = "full", **overrides: object) -> Config:
     """Build a run config from a named preset plus explicit Python overrides."""
     if preset not in PRESETS:
-        raise ValueError("preset must be one of: full, dry_run")
-    values = asdict(Config(preset=preset))
+        raise ValueError("preset must be one of: full, test")
+    values = asdict(Config())
     values.update(PRESETS[preset])
     values.update(overrides)
     return Config(**values)
@@ -147,14 +140,6 @@ def resolve_device(device: str) -> torch.device:
     return dev
 
 
-def torch_dtype(cfg: Config) -> torch.dtype:
-    if cfg.dtype == "float32":
-        return torch.float32
-    if cfg.dtype == "float64":
-        return torch.float64
-    raise ValueError("--dtype must be float32 or float64")
-
-
 def make_pulse_task(
     steps: int,
     pulse_width: int,
@@ -166,7 +151,11 @@ def make_pulse_task(
     """Generate sparse 3-channel pulses and persistent +/-1 memory targets."""
     u = np.zeros((steps, 3), dtype=np.float32)
     y = np.zeros((steps, 3), dtype=np.float32)
-    state = np.zeros(3, dtype=np.float32) if initial_state is None else initial_state.astype(np.float32).copy()
+    state = (
+        np.zeros(3, dtype=np.float32)
+        if initial_state is None
+        else initial_state.astype(np.float32).copy()
+    )
     starts: dict[int, tuple[int, float]] = {}
 
     cursor = 0
@@ -194,10 +183,13 @@ def make_pulse_task(
 
 
 def all_memories() -> list[tuple[int, int, int]]:
-    return [tuple(int(v) for v in vals) for vals in np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1])).T.reshape(-1, 3)]
+    return [
+        tuple(int(v) for v in vals)
+        for vals in np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1])).T.reshape(-1, 3)
+    ]
 
 
-def make_structured_pulse_task(
+def make_balanced_transition_task(
     steps: int,
     pulse_width: int,
     min_interval: int,
@@ -234,7 +226,9 @@ def make_structured_pulse_task(
             mem_arr = np.array(mem, dtype=np.float32)
             for route_bit in rng.permutation(3):
                 if state[route_bit] != mem_arr[route_bit]:
-                    append_steps(pulse_width, (int(route_bit), float(mem_arr[route_bit])))
+                    append_steps(
+                        pulse_width, (int(route_bit), float(mem_arr[route_bit]))
+                    )
                     append_steps(int(rng.integers(min_interval, max_interval + 1)))
             flip_sign = float(-state[bit])
             append_steps(pulse_width, (bit, flip_sign))
@@ -242,41 +236,26 @@ def make_structured_pulse_task(
             if len(u_rows) >= steps:
                 break
 
-    return torch.from_numpy(np.stack(u_rows[:steps])), torch.from_numpy(np.stack(y_rows[:steps]))
-
-
-def make_training_task(cfg: Config, rng: np.random.Generator) -> tuple[torch.Tensor, torch.Tensor]:
-    if cfg.train_task == "random":
-        return make_pulse_task(cfg.train_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng)
-    if cfg.train_task == "structured":
-        return make_structured_pulse_task(cfg.train_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng)
-    if cfg.train_task == "mixed":
-        structured_steps = int(round(cfg.train_steps * cfg.structured_fraction))
-        structured_steps = min(max(structured_steps, 0), cfg.train_steps)
-        random_steps = cfg.train_steps - structured_steps
-        parts_u: list[torch.Tensor] = []
-        parts_y: list[torch.Tensor] = []
-        if structured_steps:
-            u_s, y_s = make_structured_pulse_task(structured_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng)
-            parts_u.append(u_s)
-            parts_y.append(y_s)
-        if random_steps:
-            initial_state = parts_y[-1][-1].numpy() if parts_y else None
-            u_r, y_r = make_pulse_task(random_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng, initial_state)
-            parts_u.append(u_r)
-            parts_y.append(y_r)
-        return torch.cat(parts_u, dim=0), torch.cat(parts_y, dim=0)
-    raise ValueError("--train-task must be one of: random, structured, mixed")
+    return torch.from_numpy(np.stack(u_rows[:steps])), torch.from_numpy(
+        np.stack(y_rows[:steps])
+    )
 
 
 def init_network(cfg: Config) -> dict[str, torch.Tensor]:
     n = cfg.n
     dev = resolve_device(cfg.device)
-    dtype = torch_dtype(cfg)
-    j = cfg.g * torch.randn(n, n, device=dev, dtype=dtype) / math.sqrt(n)
-    b = cfg.input_scale * torch.randn(n, 3, device=dev, dtype=dtype) / math.sqrt(3)
-    wfb = cfg.feedback_scale * torch.randn(n, 3, device=dev, dtype=dtype) / math.sqrt(3)
-    wout = torch.zeros(3, n, device=dev, dtype=dtype)
+    j = cfg.g * torch.randn(n, n, device=dev, dtype=NETWORK_DTYPE) / math.sqrt(n)
+    b = (
+        cfg.input_scale
+        * torch.randn(n, 3, device=dev, dtype=NETWORK_DTYPE)
+        / math.sqrt(3)
+    )
+    wfb = (
+        cfg.feedback_scale
+        * torch.randn(n, 3, device=dev, dtype=NETWORK_DTYPE)
+        / math.sqrt(3)
+    )
+    wout = torch.zeros(3, n, device=dev, dtype=NETWORK_DTYPE)
     return {"j": j, "b": b, "wfb": wfb, "wout": wout}
 
 
@@ -295,10 +274,7 @@ def step_rnn(
 
 
 def train_force(
-    cfg: Config,
-    net: dict[str, torch.Tensor],
-    u: torch.Tensor,
-    target: torch.Tensor,
+    cfg: Config, net: dict[str, torch.Tensor], u: torch.Tensor, target: torch.Tensor
 ) -> list[float]:
     dev = resolve_device(cfg.device)
     dtype = net["j"].dtype
@@ -308,14 +284,11 @@ def train_force(
     x = torch.zeros(n, device=dev, dtype=dtype)
     p = torch.eye(n, device=dev, dtype=dtype) / cfg.rls_alpha
     losses: list[float] = []
-    if cfg.feedback_during_training not in {"target", "output"}:
-        raise ValueError("--feedback-during-training must be 'target' or 'output'")
 
     for t in range(cfg.train_steps):
         r = torch.tanh(x)
         z = net["wout"] @ r
-        feedback = target[t] if cfg.feedback_during_training == "target" else z
-        dx = -x + net["j"] @ r + net["wfb"] @ feedback + net["b"] @ u[t]
+        dx = -x + net["j"] @ r + net["wfb"] @ z + net["b"] @ u[t]
         x = x + cfg.dt * dx
         err = target[t] - z
         if t >= cfg.washout_steps and t % cfg.rls_every == 0:
@@ -339,7 +312,11 @@ def simulate(
     dev = resolve_device(cfg.device)
     dtype = net["j"].dtype
     u = u.to(dev, dtype=dtype)
-    x = torch.zeros(cfg.n, device=dev, dtype=dtype) if x0 is None else x0.clone().to(dev, dtype=dtype)
+    x = (
+        torch.zeros(cfg.n, device=dev, dtype=dtype)
+        if x0 is None
+        else x0.clone().to(dev, dtype=dtype)
+    )
     xs, zs = [], []
     for t in range(u.shape[0]):
         x, _, z = step_rnn(x, u[t], net, cfg.dt)
@@ -349,7 +326,9 @@ def simulate(
 
 
 @torch.no_grad()
-def settle_to_memory(cfg: Config, net: dict[str, torch.Tensor], memory: np.ndarray) -> torch.Tensor:
+def settle_to_memory(
+    cfg: Config, net: dict[str, torch.Tensor], memory: np.ndarray
+) -> torch.Tensor:
     dev = resolve_device(cfg.device)
     dtype = net["j"].dtype
     x = torch.zeros(cfg.n, device=dev, dtype=dtype)
@@ -381,7 +360,9 @@ def make_transition_trajectories(
         mem_arr = np.array(mem, dtype=np.float32)
         for bit in range(3):
             target_sign = -mem_arr[bit]
-            u = torch.zeros(cfg.pulse_width + cfg.transition_relax_steps, 3, device=dev, dtype=dtype)
+            u = torch.zeros(
+                cfg.pulse_width + cfg.transition_relax_steps, 3, device=dev, dtype=dtype
+            )
             u[: cfg.pulse_width, bit] = float(target_sign)
             xs, _, uu = simulate(cfg, net, u.cpu(), x0_cpu)
             new_mem = mem_arr.copy()
@@ -401,7 +382,9 @@ def make_transition_trajectories(
     source = (-1, -1, -1)
     x0_cpu = memory_x[source]
     for amp in amplitudes:
-        u = torch.zeros(cfg.pulse_width + cfg.transition_relax_steps, 3, device=dev, dtype=dtype)
+        u = torch.zeros(
+            cfg.pulse_width + cfg.transition_relax_steps, 3, device=dev, dtype=dtype
+        )
         u[: cfg.pulse_width, 0] = amp
         xs, _, uu = simulate(cfg, net, u.cpu(), x0_cpu)
         detailed.append({"amp": amp, "xs": xs, "u": uu})
@@ -410,8 +393,7 @@ def make_transition_trajectories(
 
 
 def make_edge_interpolation_initial_states(
-    cfg: Config,
-    memory_x: dict[tuple[int, int, int], torch.Tensor],
+    cfg: Config, memory_x: dict[tuple[int, int, int], torch.Tensor]
 ) -> torch.Tensor:
     """Seed q minimization near one-bit basin boundaries.
 
@@ -436,7 +418,11 @@ def make_edge_interpolation_initial_states(
             x1 = memory_x[tuple(target)]
             for alpha in alphas:
                 states.append((1.0 - alpha) * x0 + alpha * x1)
-    return torch.stack(states) if states else next(iter(memory_x.values())).new_empty((0, cfg.n))
+    return (
+        torch.stack(states)
+        if states
+        else next(iter(memory_x.values())).new_empty((0, cfg.n))
+    )
 
 
 def memory_states_from_stable_fixed_points(
@@ -495,14 +481,20 @@ def make_critical_pulse_initial_states(
             source_sign = int(mem[bit])
             pulse_sign = float(-source_sign)
             lo, hi = 0.0, 1.0
-            sign_lo = transition_final_sign(cfg, net, x0_cpu, bit, pulse_sign, lo, cfg.critical_relax_extra)
-            sign_hi = transition_final_sign(cfg, net, x0_cpu, bit, pulse_sign, hi, cfg.critical_relax_extra)
+            sign_lo = transition_final_sign(
+                cfg, net, x0_cpu, bit, pulse_sign, lo, cfg.critical_relax_extra
+            )
+            sign_hi = transition_final_sign(
+                cfg, net, x0_cpu, bit, pulse_sign, hi, cfg.critical_relax_extra
+            )
             if sign_lo != source_sign or sign_hi != -source_sign:
                 continue
 
             for _ in range(cfg.critical_bisection_steps):
                 mid = 0.5 * (lo + hi)
-                sign_mid = transition_final_sign(cfg, net, x0_cpu, bit, pulse_sign, mid, cfg.critical_relax_extra)
+                sign_mid = transition_final_sign(
+                    cfg, net, x0_cpu, bit, pulse_sign, mid, cfg.critical_relax_extra
+                )
                 if sign_mid == -source_sign:
                     hi = mid
                 else:
@@ -513,7 +505,9 @@ def make_critical_pulse_initial_states(
             for delta in (0.0, -0.015, 0.015):
                 a = min(1.0, max(0.0, amp + delta))
                 u = torch.zeros(
-                    cfg.pulse_width + cfg.transition_relax_steps + cfg.critical_relax_extra,
+                    cfg.pulse_width
+                    + cfg.transition_relax_steps
+                    + cfg.critical_relax_extra,
                     3,
                     device=dev,
                     dtype=dtype,
@@ -529,7 +523,7 @@ def make_critical_pulse_initial_states(
 
 
 @torch.no_grad()
-def validate_flipflop_behavior(
+def evaluate_flipflop_behavior(
     cfg: Config,
     net: dict[str, torch.Tensor],
     memory_x: dict[tuple[int, int, int], torch.Tensor],
@@ -539,7 +533,6 @@ def validate_flipflop_behavior(
     zero_u = torch.zeros(cfg.settle_steps, 3, device=dev, dtype=dtype)
     memory_ok = 0
     transition_ok = 0
-    transition_details: list[dict[str, object]] = []
 
     for mem, x0_cpu in memory_x.items():
         _, z_hold, _ = simulate(cfg, net, zero_u.cpu(), x0_cpu)
@@ -551,28 +544,19 @@ def validate_flipflop_behavior(
             target = list(mem)
             target[bit] *= -1
             target_tuple = tuple(target)
-            u = torch.zeros(cfg.pulse_width + cfg.transition_relax_steps, 3, device=dev, dtype=dtype)
+            u = torch.zeros(
+                cfg.pulse_width + cfg.transition_relax_steps, 3, device=dev, dtype=dtype
+            )
             u[: cfg.pulse_width, bit] = float(target_tuple[bit])
             _, z, _ = simulate(cfg, net, u.cpu(), x0_cpu)
             final_sign = tuple(int(v) for v in torch.sign(z[-1]).cpu().numpy())
-            ok = final_sign == target_tuple
-            transition_ok += int(ok)
-            transition_details.append(
-                {
-                    "from": mem,
-                    "bit": bit,
-                    "to": target_tuple,
-                    "final": final_sign,
-                    "ok": ok,
-                }
-            )
+            transition_ok += int(final_sign == target_tuple)
 
     return {
         "memory_hold_ok": memory_ok,
         "memory_hold_total": len(memory_x),
         "one_bit_transition_ok": transition_ok,
         "one_bit_transition_total": len(memory_x) * 3,
-        "transition_details": transition_details,
     }
 
 
@@ -589,10 +573,7 @@ def q_and_grad_numpy(x: np.ndarray, jeff: np.ndarray) -> tuple[float, np.ndarray
 
 
 def refine_fixed_points_lbfgs(
-    cfg: Config,
-    jeff: torch.Tensor,
-    xs: torch.Tensor,
-    q: torch.Tensor,
+    cfg: Config, jeff: torch.Tensor, xs: torch.Tensor, q: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if cfg.fixed_point_refine <= 0 or xs.numel() == 0:
         return xs.new_empty((0, xs.shape[1] if xs.ndim == 2 else 0)), q.new_empty((0,))
@@ -621,16 +602,16 @@ def refine_fixed_points_lbfgs(
             },
         )
         q_val, _ = q_and_grad_numpy(res.x, jeff_np)
-        refined_x.append(res.x.astype(np.float32 if xs.dtype == torch.float32 else np.float64))
+        refined_x.append(
+            res.x.astype(np.float32 if xs.dtype == torch.float32 else np.float64)
+        )
         refined_q.append(q_val)
 
     return torch.from_numpy(np.stack(refined_x)), torch.tensor(refined_q, dtype=q.dtype)
 
 
 def find_fixed_points(
-    cfg: Config,
-    net: dict[str, torch.Tensor],
-    initial_states: torch.Tensor,
+    cfg: Config, net: dict[str, torch.Tensor], initial_states: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     dev = resolve_device(cfg.device)
     dtype = net["j"].dtype
@@ -647,7 +628,10 @@ def find_fixed_points(
     best_x = x.detach().clone()
     best_q = torch.full((x.shape[0],), float("inf"), device=dev, dtype=dtype)
 
-    decay_points = {int(cfg.fixed_point_steps * 0.45), int(cfg.fixed_point_steps * 0.75)}
+    decay_points = {
+        int(cfg.fixed_point_steps * 0.45),
+        int(cfg.fixed_point_steps * 0.75),
+    }
     for step in range(cfg.fixed_point_steps):
         opt.zero_grad(set_to_none=True)
         f = autonomous_velocity(x, jeff)
@@ -675,10 +659,9 @@ def find_fixed_points(
     all_q = torch.cat([cpu_q, refined_q.to(cpu_q.dtype)], dim=0)
     return all_x, all_q
 
+
 def cluster_fixed_points(
-    xs: torch.Tensor,
-    q: torch.Tensor,
-    cfg: Config,
+    xs: torch.Tensor, q: torch.Tensor, cfg: Config
 ) -> tuple[torch.Tensor, torch.Tensor]:
     order = torch.argsort(q)
     centers: list[torch.Tensor] = []
@@ -691,7 +674,9 @@ def cluster_fixed_points(
             centers.append(x)
             center_q.append(q[idx])
             continue
-        dists = torch.stack([torch.linalg.norm(x - c) / math.sqrt(cfg.n) for c in centers])
+        dists = torch.stack(
+            [torch.linalg.norm(x - c) / math.sqrt(cfg.n) for c in centers]
+        )
         if float(dists.min()) > cfg.cluster_distance:
             centers.append(x)
             center_q.append(q[idx])
@@ -700,7 +685,9 @@ def cluster_fixed_points(
     return torch.stack(centers), torch.stack(center_q)
 
 
-def pca_fit_transform(data: torch.Tensor, n_components: int = 3) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def pca_fit_transform(
+    data: torch.Tensor, n_components: int = 3
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     mean = data.mean(dim=0)
     centered = data - mean
     _, _, vh = torch.linalg.svd(centered, full_matrices=False)
@@ -708,14 +695,14 @@ def pca_fit_transform(data: torch.Tensor, n_components: int = 3) -> tuple[torch.
     return centered @ components.T, mean, components
 
 
-def project(x: torch.Tensor, mean: torch.Tensor, components: torch.Tensor) -> torch.Tensor:
+def project(
+    x: torch.Tensor, mean: torch.Tensor, components: torch.Tensor
+) -> torch.Tensor:
     return (x - mean) @ components.T
 
 
 def classify_fixed_points(
-    cfg: Config,
-    net: dict[str, torch.Tensor],
-    fps: torch.Tensor,
+    cfg: Config, net: dict[str, torch.Tensor], fps: torch.Tensor
 ) -> list[dict[str, object]]:
     jeff = (net["j"] + net["wfb"] @ net["wout"]).detach().cpu().numpy()
     wout = net["wout"].detach().cpu().numpy()
@@ -800,7 +787,9 @@ def plot_task_behavior(
     for k, (dark, light) in enumerate(colors):
         ax.plot(t, u[:, k].numpy() * 0.65 + offsets[k], color=dark, lw=1.4)
         ax.plot(t, z[:, k].numpy() * 0.75 + offsets[k], color=light, lw=1.7)
-        ax.plot(t, target[:, k].numpy() * 0.75 + offsets[k], color=light, lw=0.8, alpha=0.25)
+        ax.plot(
+            t, target[:, k].numpy() * 0.75 + offsets[k], color=light, lw=0.8, alpha=0.25
+        )
         ax.text(-35, offsets[k] + 0.72, "+1", fontsize=9, ha="right", va="center")
         ax.text(-35, offsets[k] - 0.72, "-1", fontsize=9, ha="right", va="center")
     ax.set_xlim(0, len(t) - 1)
@@ -816,20 +805,53 @@ def plot_task_behavior(
     ax2.plot(0.45 * np.cos(theta), 0.45 * np.sin(theta), color="0.15", lw=2)
     rng = np.random.default_rng(4)
     pts = rng.normal(size=(28, 2))
-    pts = pts / np.maximum(np.linalg.norm(pts, axis=1, keepdims=True), 1e-6) * rng.uniform(0.05, 0.38, (28, 1))
-    ax2.scatter(pts[:, 0], pts[:, 1], s=18, facecolor="#f1dc6b", edgecolor="0.35", zorder=3)
+    pts = (
+        pts
+        / np.maximum(np.linalg.norm(pts, axis=1, keepdims=True), 1e-6)
+        * rng.uniform(0.05, 0.38, (28, 1))
+    )
+    ax2.scatter(
+        pts[:, 0], pts[:, 1], s=18, facecolor="#f1dc6b", edgecolor="0.35", zorder=3
+    )
     for _ in range(34):
         a, b = rng.choice(len(pts), size=2, replace=False)
-        ax2.plot([pts[a, 0], pts[b, 0]], [pts[a, 1], pts[b, 1]], color="0.65", lw=0.6, alpha=0.55)
+        ax2.plot(
+            [pts[a, 0], pts[b, 0]],
+            [pts[a, 1], pts[b, 1]],
+            color="0.65",
+            lw=0.6,
+            alpha=0.55,
+        )
     for y0 in [-0.22, 0.0, 0.22]:
-        ax2.annotate("", xy=(-0.45, y0), xytext=(-0.92, y0), arrowprops=dict(arrowstyle="->", lw=1.1))
+        ax2.annotate(
+            "",
+            xy=(-0.45, y0),
+            xytext=(-0.92, y0),
+            arrowprops=dict(arrowstyle="->", lw=1.1),
+        )
         ax2.scatter([-1.0], [y0], s=55, facecolor="#f1dc6b", edgecolor="0.25")
     for y0 in [-0.25, 0.0, 0.25]:
-        ax2.annotate("", xy=(0.88, y0), xytext=(0.45, y0), arrowprops=dict(arrowstyle="->", lw=1.1))
+        ax2.annotate(
+            "",
+            xy=(0.88, y0),
+            xytext=(0.45, y0),
+            arrowprops=dict(arrowstyle="->", lw=1.1),
+        )
         ax2.scatter([1.0], [y0], s=72, facecolor="white", edgecolor="red", lw=1.4)
     ax2.plot([1.08, 1.08, 0.25], [0.25, -0.48, -0.48], color="0.15", lw=1.7)
-    ax2.annotate("", xy=(0.25, -0.45), xytext=(0.25, -0.6), arrowprops=dict(arrowstyle="->", lw=1.0))
-    ax2.text(0, -0.72, f"FORCE/RLS readout training\nlast trace MSE={train_losses[-1]:.2e}", ha="center", fontsize=9)
+    ax2.annotate(
+        "",
+        xy=(0.25, -0.45),
+        xytext=(0.25, -0.6),
+        arrowprops=dict(arrowstyle="->", lw=1.0),
+    )
+    ax2.text(
+        0,
+        -0.72,
+        f"FORCE/RLS readout training\nlast trace MSE={train_losses[-1]:.2e}",
+        ha="center",
+        fontsize=9,
+    )
     ax2.set_xlim(-1.25, 1.25)
     ax2.set_ylim(-0.95, 0.78)
     ax2.set_title("Echo-state architecture")
@@ -860,24 +882,18 @@ def save_model_behavior_plot_data(
 
 def render_model_behavior_plot_data(out_path: Path, data: dict[str, object]) -> None:
     plot_task_behavior(
-        out_path,
-        data["u"],
-        data["z"],
-        data["target"],
-        data["train_losses"],
+        out_path, data["u"], data["z"], data["target"], data["train_losses"]
     )
 
 
-def render_model_behavior_from_model(out_path: Path, cfg_path: Path, model_path: Path) -> None:
+def render_model_behavior_from_model(
+    out_path: Path, cfg_path: Path, model_path: Path
+) -> None:
     cfg = load_config_json(cfg_path)
     cfg.device = "cpu"
     rng = np.random.default_rng(cfg.seed)
     u, target = make_pulse_task(
-        cfg.test_steps,
-        cfg.pulse_width,
-        cfg.min_interval,
-        cfg.max_interval,
-        rng,
+        cfg.test_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng
     )
     net = load_model(model_path)
     _, z, u = simulate(cfg, net, u)
@@ -923,14 +939,18 @@ def build_state_space_plot_data(
             v = torch.from_numpy(vecs[:, k])
             v = v / (torch.linalg.norm(v) + 1e-8)
             line = torch.stack([fps[i] - 1.2 * v, fps[i] + 1.2 * v])
-            unstable_lines.append(project(line, mean, comps).detach().cpu().to(torch.float32))
+            unstable_lines.append(
+                project(line, mean, comps).detach().cpu().to(torch.float32)
+            )
 
             if info["unstable_count"] == 1 and k == 0:
                 for sign in [-1.0, 1.0]:
                     x0 = fps[i] + sign * saddle_perturbation * v
                     u0 = torch.zeros(saddle_trace_steps, 3, dtype=net["j"].dtype)
                     xs, _, _ = simulate(cfg, net, u0, x0)
-                    saddle_traces.append(project(xs, mean, comps).detach().cpu().to(torch.float32))
+                    saddle_traces.append(
+                        project(xs, mean, comps).detach().cpu().to(torch.float32)
+                    )
 
     stable_by_memory = {
         tuple(int(v) for v in fp_info[i]["memory"]): fps[i].detach().cpu()
@@ -959,9 +979,13 @@ def build_state_space_plot_data(
         bit = diff_bits[0]
         source, target = (a, b) if b[bit] == 1 else (b, a)
         pulse_sign = float(target[bit])
-        relax_steps = cfg.pulse_width + max(cfg.transition_relax_steps * 3, cfg.settle_steps * 2)
+        relax_steps = cfg.pulse_width + max(
+            cfg.transition_relax_steps * 3, cfg.settle_steps * 2
+        )
 
-        def final_memory_for(src: tuple[int, int, int], dst: tuple[int, int, int]) -> tuple[int, int, int]:
+        def final_memory_for(
+            src: tuple[int, int, int], dst: tuple[int, int, int]
+        ) -> tuple[int, int, int]:
             u = torch.zeros(relax_steps, 3, dtype=net["j"].dtype)
             u[: cfg.pulse_width, bit] = float(dst[bit])
             _, zs, _ = simulate(cfg, net, u, stable_by_memory[src])
@@ -1014,9 +1038,19 @@ def build_state_space_plot_data(
 
         for mem in (source, target):
             p = project(stable_by_memory[mem][None, :], mean, comps).detach().cpu()[0]
-            right_points.append({"coords": torch.tensor([p[2], 0.0, p[0]], dtype=torch.float32), "kind": "stable"})
+            right_points.append(
+                {
+                    "coords": torch.tensor([p[2], 0.0, p[0]], dtype=torch.float32),
+                    "kind": "stable",
+                }
+            )
         p = saddle_projected
-        right_points.append({"coords": torch.tensor([p[2], 0.0, p[0]], dtype=torch.float32), "kind": "saddle"})
+        right_points.append(
+            {
+                "coords": torch.tensor([p[2], 0.0, p[0]], dtype=torch.float32),
+                "kind": "saddle",
+            }
+        )
         right_ylabel = f"input {bit + 1}"
         right_title = f"Input-amplitude transition {source} -> {target}"
     else:
@@ -1057,7 +1091,9 @@ def build_state_space_plot_data(
     }
 
 
-def draw_fixed_points_transition_panel(ax: plt.Axes, cfg: Config, data: dict[str, object]) -> None:
+def draw_fixed_points_transition_panel(
+    ax: plt.Axes, data: dict[str, object], elev: float = 18.0, azim: float = -62.0
+) -> None:
     left = data["left"]
     for pts_t in left["transition_curves"]:
         pts = pts_t.numpy()
@@ -1085,11 +1121,13 @@ def draw_fixed_points_transition_panel(ax: plt.Axes, cfg: Config, data: dict[str
     ax.set_ylabel("PC2")
     ax.set_zlabel("PC3")
     ax.set_title("Fixed points and 1-bit transitions")
-    ax.view_init(elev=cfg.state_space_left_elev, azim=cfg.state_space_left_azim)
+    ax.view_init(elev=elev, azim=azim)
     ax.legend(loc="upper left", fontsize=8)
 
 
-def draw_input_amplitude_state_space_panel(ax: plt.Axes, data: dict[str, object]) -> None:
+def draw_input_amplitude_state_space_panel(
+    ax: plt.Axes, data: dict[str, object]
+) -> None:
     right = data["right"]
     cmap = plt.get_cmap("viridis")
     norm = matplotlib.colors.Normalize(vmin=0.0, vmax=1.0)
@@ -1098,15 +1136,15 @@ def draw_input_amplitude_state_space_panel(ax: plt.Axes, data: dict[str, object]
         amp = float(item.get("input_amplitude", pts[0, 1]))
         color = cmap(norm(amp))
         xy = np.column_stack([pts[:, 0], pts[:, 2]])
-        ax.plot(xy[:, 0], xy[:, 1], color=color, lw=item["lw"], alpha=item["alpha"], zorder=2)
-        add_flow_arrow(
-            ax,
-            xy,
+        ax.plot(
+            xy[:, 0],
+            xy[:, 1],
             color=color,
-            frac=0.5,
-            size=12.0,
-            lw=1.2,
+            lw=item["lw"],
+            alpha=item["alpha"],
+            zorder=2,
         )
+        add_flow_arrow(ax, xy, color=color, frac=0.5, size=12.0, lw=1.2)
     non_stable_points = [item for item in right["points"] if item["kind"] != "stable"]
     stable_points = [item for item in right["points"] if item["kind"] == "stable"]
     for item in non_stable_points + stable_points:
@@ -1118,14 +1156,18 @@ def draw_input_amplitude_state_space_panel(ax: plt.Axes, data: dict[str, object]
     ax.set_xlabel("PC3")
     ax.set_ylabel("PC1")
     ax.grid(True, alpha=0.35)
-    colorbar = ax.figure.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, shrink=0.84, pad=0.03)
+    colorbar = ax.figure.colorbar(
+        matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, shrink=0.84, pad=0.03
+    )
     colorbar.set_label(right["ylabel"])
 
 
-def render_fixed_points_transition_plot_data(out_path: Path, cfg: Config, data: dict[str, object]) -> None:
+def render_fixed_points_transition_plot_data(
+    out_path: Path, data: dict[str, object], elev: float = 18.0, azim: float = -62.0
+) -> None:
     fig = plt.figure(figsize=(7.2, 6.0), constrained_layout=True)
     ax = fig.add_subplot(1, 1, 1, projection="3d")
-    draw_fixed_points_transition_panel(ax, cfg, data)
+    draw_fixed_points_transition_panel(ax, data, elev=elev, azim=azim)
     fig.suptitle(
         f"Fixed points: {data['num_fixed_points']} total "
         f"({data['stable_count']} stable, {data['saddle_count']} one-dimensional saddles)",
@@ -1155,23 +1197,35 @@ def plot_state_space_analysis(
 ) -> None:
     data = build_state_space_plot_data(cfg, net, transitions, detailed, fps, fp_info)
     torch.save(data, model_dir / "state_space_plot_data.pt")
-    render_fixed_points_transition_plot_data(figure_dir / "fixed_points_1d_transition.png", cfg, data)
+    render_fixed_points_transition_plot_data(
+        figure_dir / "fixed_points_1d_transition.png", data
+    )
     render_state_space_plot_data(figure_dir / "state_space.png", data)
 
 
-def redraw_state_space_from_plot_data(cfg: Config) -> None:
-    data_path = Path(cfg.redraw_from_plot_data)
+def redraw_state_space_from_plot_data(
+    data_path: Path,
+    figure_dir: Path,
+    fixed_points_elev: float = 18.0,
+    fixed_points_azim: float = -62.0,
+) -> None:
     data = torch.load(data_path, map_location="cpu", weights_only=False)
-    figure_dir = Path(cfg.figure_dir)
     figure_dir.mkdir(parents=True, exist_ok=True)
-    render_fixed_points_transition_plot_data(figure_dir / "fixed_points_1d_transition.png", cfg, data)
+    render_fixed_points_transition_plot_data(
+        figure_dir / "fixed_points_1d_transition.png",
+        data,
+        elev=fixed_points_elev,
+        azim=fixed_points_azim,
+    )
     render_state_space_plot_data(figure_dir / "state_space.png", data)
     print(
         json.dumps(
             {
                 "redraw_from_plot_data": str(data_path),
                 "outputs": {
-                    "fixed_points_transition_png": str(figure_dir / "fixed_points_1d_transition.png"),
+                    "fixed_points_transition_png": str(
+                        figure_dir / "fixed_points_1d_transition.png"
+                    ),
                     "state_space_png": str(figure_dir / "state_space.png"),
                 },
                 "num_fixed_points": int(data["num_fixed_points"]),
@@ -1180,9 +1234,7 @@ def redraw_state_space_from_plot_data(cfg: Config) -> None:
                     "one_unstable": int(data["saddle_count"]),
                     "more_than_one_unstable": int(data["other_count"]),
                 },
-                "state_space_view": {
-                    "left": [cfg.state_space_left_elev, cfg.state_space_left_azim],
-                },
+                "fixed_points_view": [fixed_points_elev, fixed_points_azim],
             },
             indent=2,
         )
@@ -1190,10 +1242,6 @@ def redraw_state_space_from_plot_data(cfg: Config) -> None:
 
 
 def run(cfg: Config) -> None:
-    torch_dtype(cfg)
-    if cfg.redraw_from_plot_data:
-        redraw_state_space_from_plot_data(cfg)
-        return
     device = resolve_device(cfg.device)
     set_seed(cfg.seed)
     model_dir = Path(cfg.model_dir)
@@ -1203,21 +1251,22 @@ def run(cfg: Config) -> None:
 
     rng = np.random.default_rng(cfg.seed)
     net = init_network(cfg)
-    u_train, y_train = make_training_task(cfg, rng)
+    u_train, y_train = make_balanced_transition_task(
+        cfg.train_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng
+    )
     losses = train_force(cfg, net, u_train, y_train)
 
     u_test, y_test = make_pulse_task(
-        cfg.test_steps,
-        cfg.pulse_width,
-        cfg.min_interval,
-        cfg.max_interval,
-        rng,
+        cfg.test_steps, cfg.pulse_width, cfg.min_interval, cfg.max_interval, rng
     )
     xs_test, z_test, u_test = simulate(cfg, net, u_test)
     test_mse = float(torch.mean((z_test - y_test) ** 2))
 
     memories = all_memories()
-    memory_x = {mem: settle_to_memory(cfg, net, np.array(mem, dtype=np.float32)) for mem in memories}
+    memory_x = {
+        mem: settle_to_memory(cfg, net, np.array(mem, dtype=np.float32))
+        for mem in memories
+    }
     transitions, detailed = make_transition_trajectories(cfg, net, memory_x)
 
     transition_states = torch.cat([item["xs"][::4] for item in transitions], dim=0)
@@ -1227,18 +1276,39 @@ def run(cfg: Config) -> None:
     for item in transitions:
         midpoint_states.append(item["xs"][cfg.pulse_width + 10])
         midpoint_states.append(item["xs"][cfg.pulse_width + 35])
-    fp_initial = torch.cat([transition_states, memory_states, edge_states, torch.stack(midpoint_states), xs_test[::8]], dim=0)
+    fp_initial = torch.cat(
+        [
+            transition_states,
+            memory_states,
+            edge_states,
+            torch.stack(midpoint_states),
+            xs_test[::8],
+        ],
+        dim=0,
+    )
     fp_candidates, q_candidates = find_fixed_points(cfg, net, fp_initial)
     critical_thresholds: list[dict[str, object]] = []
     if cfg.critical_pulse_ics:
         attractor_cfg = Config(**asdict(cfg))
-        attractor_cfg.fixed_point_q_thresh = max(cfg.fixed_point_q_thresh, cfg.critical_attractor_q_thresh)
+        attractor_cfg.fixed_point_q_thresh = max(
+            cfg.fixed_point_q_thresh, cfg.critical_attractor_q_thresh
+        )
         prelim_fps, _ = cluster_fixed_points(fp_candidates, q_candidates, attractor_cfg)
-        prelim_info = classify_fixed_points(attractor_cfg, net, prelim_fps) if len(prelim_fps) else []
-        memory_x = memory_states_from_stable_fixed_points(memory_x, prelim_fps, prelim_info)
-        critical_states, critical_thresholds = make_critical_pulse_initial_states(cfg, net, memory_x)
+        prelim_info = (
+            classify_fixed_points(attractor_cfg, net, prelim_fps)
+            if len(prelim_fps)
+            else []
+        )
+        memory_x = memory_states_from_stable_fixed_points(
+            memory_x, prelim_fps, prelim_info
+        )
+        critical_states, critical_thresholds = make_critical_pulse_initial_states(
+            cfg, net, memory_x
+        )
         if len(critical_states):
-            critical_candidates, critical_q = find_fixed_points(cfg, net, critical_states)
+            critical_candidates, critical_q = find_fixed_points(
+                cfg, net, critical_states
+            )
             fp_candidates = torch.cat([fp_candidates, critical_candidates], dim=0)
             q_candidates = torch.cat([q_candidates, critical_q], dim=0)
         transitions, detailed = make_transition_trajectories(cfg, net, memory_x)
@@ -1247,12 +1317,18 @@ def run(cfg: Config) -> None:
     fp_info = classify_fixed_points(cfg, net, fps) if len(fps) else []
     memory_x = memory_states_from_stable_fixed_points(memory_x, fps, fp_info)
     transitions, detailed = make_transition_trajectories(cfg, net, memory_x)
-    behavior = validate_flipflop_behavior(cfg, net, memory_x)
+    behavior = evaluate_flipflop_behavior(cfg, net, memory_x)
 
-    save_model_behavior_plot_data(model_dir / "model_behavior_plot_data.pt", u_test, z_test, y_test, losses)
-    plot_task_behavior(figure_dir / "model_behavior.png", u_test, z_test, y_test, losses)
+    save_model_behavior_plot_data(
+        model_dir / "model_behavior_plot_data.pt", u_test, z_test, y_test, losses
+    )
+    plot_task_behavior(
+        figure_dir / "model_behavior.png", u_test, z_test, y_test, losses
+    )
     if len(fps):
-        plot_state_space_analysis(model_dir, figure_dir, cfg, net, transitions, detailed, fps, fp_info)
+        plot_state_space_analysis(
+            model_dir, figure_dir, cfg, net, transitions, detailed, fps, fp_info
+        )
 
     stable_count = sum(1 for item in fp_info if item["unstable_count"] == 0)
     saddle_count = sum(1 for item in fp_info if item["unstable_count"] == 1)
@@ -1266,10 +1342,16 @@ def run(cfg: Config) -> None:
         "cfg_json": str(model_dir / "cfg.json"),
         "model_pt": str(model_dir / "model.pt"),
         "model_behavior_plot_data": str(model_dir / "model_behavior_plot_data.pt"),
-        "fixed_point_analysis_pt": str(model_dir / "fixed_point_analysis.pt") if len(fps) else None,
-        "state_space_plot_data": str(model_dir / "state_space_plot_data.pt") if len(fps) else None,
+        "fixed_point_analysis_pt": (
+            str(model_dir / "fixed_point_analysis.pt") if len(fps) else None
+        ),
+        "state_space_plot_data": (
+            str(model_dir / "state_space_plot_data.pt") if len(fps) else None
+        ),
         "model_behavior_png": str(figure_dir / "model_behavior.png"),
-        "fixed_points_transition_png": str(figure_dir / "fixed_points_1d_transition.png") if len(fps) else None,
+        "fixed_points_transition_png": (
+            str(figure_dir / "fixed_points_1d_transition.png") if len(fps) else None
+        ),
         "state_space_png": str(figure_dir / "state_space.png") if len(fps) else None,
     }
 
@@ -1281,7 +1363,6 @@ def run(cfg: Config) -> None:
                 "fixed_point_candidates": fp_candidates.detach().cpu(),
                 "fixed_point_candidate_q": q_candidates.detach().cpu(),
                 "critical_pulse_thresholds": critical_thresholds,
-                "behavior": behavior,
                 "fixed_points": fps.detach().cpu(),
                 "fixed_point_q": fp_q.detach().cpu(),
                 "fixed_point_counts": fixed_point_counts,

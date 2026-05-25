@@ -1,24 +1,29 @@
-"""Course-friendly entrypoint for the 3-bit flip-flop RNN demo."""
+"""Training entrypoint for the 3-bit flip-flop RNN demo."""
 
-from flipflop_demo import make_config, run
+from pathlib import Path
 
+from flipflop_demo import make_config, redraw_state_space_from_plot_data, run
 
 # Edit this object to choose the run mode and parameters. Keeping it here makes
 # this file the only training/analysis entrypoint.
-RUN_CONFIG = make_config(
-    preset="full",
-    model_dir="model",
-    figure_dir="figure",
-    redraw_from_plot_data="model/state_space_plot_data.pt",
-    state_space_left_elev=18.0,
-    state_space_left_azim=-62.0,
-)
+RUN_CONFIG = make_config(preset="full", model_dir="model", figure_dir="figure")
 
 # For a quick end-to-end check, change the first argument above to
-# ``preset="dry_run"`` and clear ``redraw_from_plot_data``.
+# ``preset="test"`` and clear ``REDRAW_FROM_PLOT_DATA``.
+REDRAW_FROM_PLOT_DATA = "model/state_space_plot_data.pt"
+FIXED_POINTS_ELEV = 18.0
+FIXED_POINTS_AZIM = -62.0
 
 
 def main() -> None:
+    if REDRAW_FROM_PLOT_DATA:
+        redraw_state_space_from_plot_data(
+            Path(REDRAW_FROM_PLOT_DATA),
+            Path(RUN_CONFIG.figure_dir),
+            fixed_points_elev=FIXED_POINTS_ELEV,
+            fixed_points_azim=FIXED_POINTS_AZIM,
+        )
+        return
     run(RUN_CONFIG)
 
 

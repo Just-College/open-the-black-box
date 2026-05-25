@@ -24,7 +24,9 @@ def main() -> None:
     cfg = PLOT_CONFIG
     data_path = Path(cfg.plot_data)
     if not data_path.exists():
-        raise FileNotFoundError(f"{data_path} does not exist. Run run_flipflop_demo.py first.")
+        raise FileNotFoundError(
+            f"{data_path} does not exist. Run run_flipflop_demo.py first."
+        )
     data = torch.load(data_path, map_location="cpu", weights_only=False)
     out_path = Path(cfg.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
