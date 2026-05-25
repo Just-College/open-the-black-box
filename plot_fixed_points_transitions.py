@@ -16,7 +16,7 @@ class PlotConfig:
     out: str = "figure/fixed_points_1d_transition.png"
     fixed_points_elev: float = 18.0
     fixed_points_azim: float = -62.0
-    show: bool = False
+    show: bool = True
 
 
 # Edit this object to change input/output paths.

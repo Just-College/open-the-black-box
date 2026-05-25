@@ -19,7 +19,7 @@ class PlotConfig:
     cfg: str = "model/cfg.json"
     model: str = "model/model.pt"
     out: str = "figure/model_behavior.png"
-    show: bool = False
+    show: bool = True
 
 
 # Edit this object to change input/output paths.

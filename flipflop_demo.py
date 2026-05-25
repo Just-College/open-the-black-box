@@ -14,22 +14,14 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 import matplotlib
-
-if (
-    "MPLBACKEND" not in os.environ
-    and "DISPLAY" not in os.environ
-    and "WAYLAND_DISPLAY" not in os.environ
-):
-    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MultipleLocator
 import numpy as np
 import torch
+from matplotlib.ticker import MultipleLocator
 from scipy.optimize import minimize
 
 NETWORK_DTYPE = torch.float64
@@ -1047,7 +1039,7 @@ def build_state_space_plot_data(
         for amp in np.linspace(0.0, 1.0, 11):
             u = torch.zeros(relax_steps, 3, dtype=net["j"].dtype)
             u[: cfg.pulse_width, bit] = pulse_sign * float(amp)
-            xs, _, uu = simulate(cfg, net, u, stable_by_memory[source])
+            xs, _ = simulate(cfg, net, u, stable_by_memory[source])
             pts = project(xs, mean, comps).detach().cpu()
             inp = torch.full((pts.shape[0],), float(amp), dtype=pts.dtype)
             coords = torch.stack([pts[:, 2], inp, pts[:, 0]], dim=1).to(torch.float32)

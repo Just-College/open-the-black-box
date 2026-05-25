@@ -28,6 +28,12 @@ seed, training quality, numerical precision, and fixed-point search coverage.
 
 ## Quick Start
 
+First, install the required dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
 Run the full training, fixed-point analysis, cache generation, and plotting
 pipeline:
 

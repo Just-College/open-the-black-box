@@ -14,7 +14,7 @@ from flipflop_demo import render_state_space_plot_data
 class PlotConfig:
     plot_data: str = "model/state_space_plot_data.pt"
     out: str = "figure/state_space.png"
-    show: bool = False
+    show: bool = True
 
 
 # Edit this object to change input/output paths.
