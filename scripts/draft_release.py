@@ -19,7 +19,7 @@ VERSION = "v2.7"
 # fmt: off
 INCLUDE_DIRS = [
     "model",
-    "flipflop_demo,py",
+    "flipflop_demo.py",
     "paper.pdf",
     "plot_fixed_points_transitions.py",
     "plot_model_behavior.py",
