@@ -1,13 +1,13 @@
-"""Run the 3-bit flip-flop RNN teaching demo from Sussillo & Barak (2013).
+"""Run the 3-bit flip-flop RNN demo from Sussillo & Barak (2013).
 
 The script trains a 3-bit flip-flop echo-state RNN with FORCE/RLS-style
 updates to the readout weights, then searches fixed points in the zero-input
 autonomous dynamics and plots task behavior plus low-dimensional state-space
 summaries.
 
-Use ``run_flipflop_demo.py`` as the course entrypoint. This module is
-kept as the shared implementation library for training, fixed-point analysis,
-cached data generation, and figure rendering helpers.
+Use ``run_flipflop_demo.py`` as the main entrypoint. This module is kept as
+the shared implementation library for training, fixed-point analysis, cached
+data generation, and figure rendering helpers.
 """
 
 from __future__ import annotations
